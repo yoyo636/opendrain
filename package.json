@@ -1,0 +1,46 @@
+{
+  "name": "opendrain",
+  "version": "0.1.0",
+  "description": "Agent-native download layer: fetch(url, target, checksum?, mirrors?, resume?) — bytes go to disk, one JSON line comes back. Resumable across processes and sessions, checksum-verified, zero content-token cost.",
+  "bin": {
+    "opendrain": "bin/opendrain.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "scripts/",
+    "skills/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yoyo636/opendrain.git"
+  },
+  "homepage": "https://github.com/yoyo636/opendrain",
+  "bugs": {
+    "url": "https://github.com/yoyo636/opendrain/issues"
+  },
+  "keywords": [
+    "agent",
+    "agent-native",
+    "download",
+    "downloader",
+    "cli",
+    "aria2",
+    "resume",
+    "checksum",
+    "mirror",
+    "opendrain"
+  ]
+}

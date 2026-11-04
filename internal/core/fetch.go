@@ -77,6 +77,18 @@ func Fetch(ctx context.Context, req Request, store *Store, backends []Downloader
 
 	id := IDFor(req.URL, req.Target)
 	res.ID = id
+	// Two agents may issue the same fetch at the same time; without a
+	// cross-process lock they would overwrite each other's state and the
+	// same .part file. Hold the lock for the whole pipeline.
+	release, lerr := store.TaskLock(ctx, id)
+	if lerr != nil {
+		code := CodeInternal
+		if errors.Is(lerr, context.Canceled) || errors.Is(lerr, context.DeadlineExceeded) {
+			code = CodeCancelled
+		}
+		return fatal(store, nil, code, "acquire task lock: "+lerr.Error(), nil, begin)
+	}
+	defer release()
 	st, err := store.Get(id)
 	if err != nil {
 		if !errors.Is(err, ErrCorruptState) {
@@ -110,10 +122,19 @@ func Fetch(ctx context.Context, req Request, store *Store, backends []Downloader
 				st.Sha256 = "sha256:" + sum
 				st.Total = fi.Size()
 				if req.Checksum != "" && st.Sha256 != req.Checksum {
-					os.Remove(req.Target)
-					return fatal(store, st, CodeChecksum,
-						"checksum mismatch on cached file; file removed",
-						map[string]any{"expected": req.Checksum, "actual": st.Sha256}, begin)
+					// This is the user's existing file, not a temp .part:
+					// never delete it on a mismatch. Move it aside so the
+					// agent can inspect the bytes that failed verification.
+					moved := quarantineTarget(req.Target)
+					detail := map[string]any{"expected": req.Checksum, "actual": st.Sha256}
+					msg := "checksum mismatch on cached file"
+					if moved != "" {
+						detail["quarantined_as"] = moved
+						msg += "; file moved to " + moved
+					} else {
+						msg += "; file left in place (rename failed)"
+					}
+					return fatal(store, st, CodeChecksum, msg, detail, begin)
 				}
 				_ = store.Put(st)
 				fillResult(res, st, false, true, begin)
@@ -305,6 +326,20 @@ func sizeOf(p string) int64 {
 		return fi.Size()
 	}
 	return -1
+}
+
+// quarantineTarget renames a file that failed verification to
+// <path>.corrupt instead of removing it. If that name is taken, a
+// timestamped variant is used so evidence is never overwritten.
+func quarantineTarget(path string) string {
+	dst := path + ".corrupt"
+	if _, err := os.Stat(dst); err == nil {
+		dst = fmt.Sprintf("%s.corrupt-%d", path, time.Now().UnixNano())
+	}
+	if err := os.Rename(path, dst); err != nil {
+		return ""
+	}
+	return dst
 }
 
 func fatal(store *Store, st *State, code, msg string, detail map[string]any, begin time.Time) (*Result, *State) {

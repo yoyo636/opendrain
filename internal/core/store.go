@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -66,6 +67,14 @@ func NewStore() (*Store, error) {
 func (s *Store) Path(id string) string { return filepath.Join(s.dir, id+".json") }
 
 func (s *Store) Dir() string { return s.dir }
+
+// TaskLock blocks until this process holds the exclusive lock for id, or ctx
+// is cancelled. Callers must defer the returned release func for the entire
+// fetch pipeline — two agents targeting the same file must never write the
+// same state file or the same <target>.part concurrently.
+func (s *Store) TaskLock(ctx context.Context, id string) (func(), error) {
+	return acquireTaskLock(ctx, filepath.Join(s.dir, id+".lock"))
+}
 
 // Get returns (nil, nil) when no state exists for id.
 func (s *Store) Get(id string) (*State, error) {

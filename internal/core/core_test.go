@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -162,5 +163,98 @@ func TestFileSha256KnownVector(t *testing.T) {
 	want := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 	if got != want {
 		t.Errorf("sha256(\"\")=%s, want %s", got, want)
+	}
+}
+
+func TestTaskLockSerializesAndReleases(t *testing.T) {
+	t.Setenv("OPENDRAIN_STATE_DIR", filepath.Join(t.TempDir(), "state"))
+	s, err := NewStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := s.TaskLock(context.Background(), "task-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A second caller for the same task must not proceed while the lock is
+	// held; it gives up when its context expires rather than deadlocking.
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if _, err := s.TaskLock(ctx, "task-a"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected DeadlineExceeded while locked, got %v", err)
+	}
+
+	// A different task is unaffected — locks are per (url, target).
+	relOther, err := s.TaskLock(context.Background(), "task-b")
+	if err != nil {
+		t.Errorf("unrelated task should not be blocked: %v", err)
+	} else {
+		relOther()
+	}
+
+	release()
+	relAgain, err := s.TaskLock(context.Background(), "task-a")
+	if err != nil {
+		t.Fatalf("lock not released after release(): %v", err)
+	}
+	relAgain()
+}
+
+func TestCachedChecksumMismatchQuarantinesInsteadOfDeleting(t *testing.T) {
+	t.Setenv("OPENDRAIN_STATE_DIR", filepath.Join(t.TempDir(), "state"))
+	s, err := NewStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "cached.bin")
+	if err := os.WriteFile(target, []byte("precious bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	req := Request{URL: "http://example.invalid/f", Target: target, Resume: true}
+	id := IDFor(req.URL, req.Target)
+	if err := s.Put(&State{ID: id, Status: StatusCompleted, Request: req, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, _ := Fetch(context.Background(), Request{
+		URL: req.URL, Target: target, Resume: true, Backend: "native",
+		Checksum: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+	}, s, nil)
+	if res.OK || res.Error == nil || res.Error.Code != CodeChecksum {
+		t.Fatalf("expected checksum_mismatch, got %+v", res.Error)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Errorf("original target should no longer be at its path: %v", err)
+	}
+	corrupt := target + ".corrupt"
+	got, err := os.ReadFile(corrupt)
+	if err != nil || string(got) != "precious bytes" {
+		t.Fatalf("quarantined file missing or changed: %q %v", got, err)
+	}
+	if res.Error.Detail["quarantined_as"] != corrupt {
+		t.Errorf("detail should report the quarantine path, got %v", res.Error.Detail)
+	}
+
+	// A second mismatch must not overwrite the first piece of evidence.
+	if err := os.WriteFile(target, []byte("second"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(&State{ID: id, Status: StatusCompleted, Request: req, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	res2, _ := Fetch(context.Background(), Request{
+		URL: req.URL, Target: target, Resume: true, Backend: "native",
+		Checksum: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+	}, s, nil)
+	if res2.Error == nil || res2.Error.Code != CodeChecksum {
+		t.Fatalf("second mismatch failed: %+v", res2.Error)
+	}
+	if first, err := os.ReadFile(corrupt); err != nil || string(first) != "precious bytes" {
+		t.Errorf("first quarantined file was overwritten: %q %v", first, err)
+	}
+	matches, _ := filepath.Glob(target + ".corrupt-*")
+	if len(matches) != 1 {
+		t.Errorf("expected a timestamped second quarantine file, got %v", matches)
 	}
 }

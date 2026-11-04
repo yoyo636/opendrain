@@ -18,6 +18,11 @@ opendrain install             # 把 fetch skill 装进各 agent 的 skills 目�
 npm 包是零依赖的纯 JS 启动器：`postinstall` 从 GitHub Release 拉取当前平台的二进制；
 拉取失败也不会让安装中断，launcher 会在首次运行时重试。包内同时附带 `skills/fetch/SKILL.md`。
 
+> npm 12 起默认拦截依赖的安装脚本。若想在安装时就下载好二进制（省掉首次运行的等待）：
+> `npm install -g --allow-scripts=opendrain opendrain`，
+> 或 `npm config set allow-scripts=opendrain --location=user`。
+> 不加也能用——launcher 会在第一次执行时自动补下二进制。
+
 ### 源码
 
 ```sh
@@ -72,9 +77,10 @@ internal/backend
 ## 测试
 
 ```sh
-go test ./...    # 18 个用例：分片/sha、取消续传、镜像故障切换、校验失败零残留、
+go test ./...    # 20 个用例：分片/sha、取消续传、镜像故障切换、校验失败零残留、
                  # 无 Range 回退、未知大小流式、缓存幂等、探测排序、假 aria2 RPC 协议、
-                 # 谎报 Accept-Ranges 的服务器、残片丢失不虚报 resumed、状态文件损坏自愈
+                 # 谎报 Accept-Ranges 的服务器、残片丢失不虚报 resumed、状态文件损坏自愈、
+                 # 跨进程任务锁、缓存文件校验失败保留 .corrupt
 ```
 
 真实场景数据见 [BENCHMARK.md](BENCHMARK.md)。
@@ -89,6 +95,15 @@ go test ./...    # 18 个用例：分片/sha、取消续传、镜像故障切换
 | `resumed` 虚报 | 残片丢失后重下，JSON 仍报 `resumed: true` | `resumed` 改到残片存活检查之后计算，无残片可续时为 false |
 | 相对路径下 `status` 查不到任务 | `fetch` 与 `status` 算出两个不同 ID | ID 统一按绝对路径归一化，三处调用一致 |
 | 状态文件损坏导致任务卡死 | 同一个命令永远返回 `internal_error`，无自救手段 | `fetch` 自动隔离坏文件并从头开始（`warnings` 说明），`status` 报 `state_corrupt`，新增 `opendrain clean` |
+
+## 并发与文件安全（2026-11-04）
+
+| 问题 | 修复 |
+|---|---|
+| 两个 Agent 同时 `fetch` 同一个 `(url, target)` 会互踩状态文件和 `.part` | 按任务 ID 加跨进程独占锁（`flock`），锁覆盖从读状态到原子发布的整个流水线；进程被杀时由内核自动释放，不会留下死锁文件。抢不到锁时按 `ctx` 取消，不无限阻塞 |
+| 缓存文件校验失败时直接删除用户已有文件 | 改名为 `<target>.corrupt`（已存在则加时间戳后缀），路径写进 `error.detail.quarantined_as`，字节保留可复查；`.part` 临时文件仍直接删除 |
+
+> Windows 上标准库没有 advisory `flock`，目前该平台不做跨进程串行化（状态写入本身仍是原子的）；Unix/macOS/Linux 完整生效。
 
 ## 范围外（后续迭代）
 

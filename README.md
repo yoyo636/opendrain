@@ -6,6 +6,20 @@
 所以状态落盘可续传；它不"打开看看"，所以完整性必须强制校验；它不读设置面板，所以零配置；
 它调用下载的时机是代码执行中途，所以内容**永远不进 context**，只回一行 JSON。
 
+## Agent 会话生命周期
+
+OpenDrain 不只是下载器，而是 Agent 全程使用的文件层：
+
+| 阶段 | 命令 | Agent 得到什么 |
+|---|---|---|
+| 会话启动 / compaction 后 | `opendrain manifest [--verify]` | 之前所有会话留下的文件、路径、sha256、是否还在磁盘上 |
+| 需要新字节 | `opendrain fetch ...` | 文件落盘 + 一行 JSON；中断重调即续传 |
+| 信任一个缓存文件前 | `opendrain verify [--target PATH]` | 重哈希对比，mismatch 时退出 1 |
+| 检查大文件 | `opendrain read --target PATH --grep RE --context N` | 只看需要的几行，默认最多返回 256KB |
+| 结束 / 下次继续 | （无需操作） | 状态留在 `~/.opendrain/state`，下次 manifest 可见 |
+
+`opendrain install` 会把完整生命周期 skill 装到 OpenCode / Claude Code / Codex / zcode / agents 的检测到的配置目录，同时保留 `fetch` 兼容别名（不覆盖已自定义的旧 skill）。
+
 ## 安装
 
 ### npm（跨平台，自动拉取对应平台的预编译二进制）

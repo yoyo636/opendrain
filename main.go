@@ -20,8 +20,11 @@ import (
 	"opendrain/internal/core"
 )
 
-//go:embed skills/fetch/SKILL.md
+//go:embed skills/opendrain/SKILL.md
 var skillMD []byte
+
+//go:embed skills/fetch/SKILL.md
+var legacySkillMD []byte
 
 func main() {
 	if len(os.Args) < 2 {
@@ -35,6 +38,12 @@ func main() {
 		runStatus(os.Args[2:])
 	case "clean":
 		runClean(os.Args[2:])
+	case "manifest":
+		runManifest(os.Args[2:])
+	case "verify":
+		runVerify(os.Args[2:])
+	case "read":
+		runRead(os.Args[2:])
 	case "install":
 		runInstall()
 	default:
@@ -52,7 +61,11 @@ Usage:
                   [--mirror URL]... [--no-resume] [--backend auto|aria2|native]
   opendrain status (--url URL --target PATH | --id ID)
   opendrain clean (--url URL --target PATH | --id ID | --all)
-  opendrain install          install the fetch skill into agent configs
+  opendrain manifest [--verify]      list every file this agent manages
+  opendrain verify [--target PATH]   re-hash managed files against stored digests
+  opendrain read --target PATH [--grep RE] [--context N] [--head N | --tail N]
+                          [--max-bytes N]   bounded excerpt, no bulk context cost
+  opendrain install          install the opendrain skill into agent configs
 
 fetch(url, target, checksum?, mirrors?, resume?) — bytes go to disk, one JSON
 result line to stdout, errors are structured and always leave the target path
@@ -265,21 +278,138 @@ func runClean(args []string) {
 	})
 }
 
+// runManifest is the session-start call: an agent sees every file previous
+// sessions (or itself) put on disk, with integrity state, in one JSON object.
+func runManifest(args []string) {
+	fs := flag.NewFlagSet("manifest", flag.ExitOnError)
+	verifyF := fs.Bool("verify", false, "re-hash every on-disk file against its recorded digest")
+	_ = fs.Parse(args)
+	begin := time.Now()
+	store, err := core.NewStore()
+	if err != nil {
+		emit(&core.Result{OK: false, Status: core.StatusFailed,
+			Error: &core.ErrInfo{Code: core.CodeInternal, Message: err.Error()}})
+		os.Exit(1)
+	}
+	m, err := store.Manifest(*verifyF, begin)
+	if err != nil {
+		emit(&core.Result{OK: false, Status: core.StatusFailed,
+			Error: &core.ErrInfo{Code: core.CodeInternal, Message: err.Error()}})
+		os.Exit(1)
+	}
+	emit(m)
+}
+
+// runVerify re-hashes files and reports which ones still match the digest
+// OpenDrain recorded when it published them. Target filter is optional.
+func runVerify(args []string) {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	targetF := fs.String("target", "", "only verify this target path")
+	_ = fs.Parse(args)
+	begin := time.Now()
+	store, err := core.NewStore()
+	if err != nil {
+		emit(&core.Result{OK: false, Status: core.StatusFailed,
+			Error: &core.ErrInfo{Code: core.CodeInternal, Message: err.Error()}})
+		os.Exit(1)
+	}
+	m, err := store.Manifest(true, begin)
+	if err != nil {
+		emit(&core.Result{OK: false, Status: core.StatusFailed,
+			Error: &core.ErrInfo{Code: core.CodeInternal, Message: err.Error()}})
+		os.Exit(1)
+	}
+	if *targetF != "" {
+		abs, aerr := filepath.Abs(*targetF)
+		if aerr != nil {
+			emit(&core.Result{OK: false, Status: core.StatusFailed,
+				Error: &core.ErrInfo{Code: core.CodeBadInput, Message: aerr.Error()}})
+			os.Exit(2)
+		}
+		filtered := []core.ManifestEntry{}
+		for _, e := range m.Entries {
+			if e.Target == abs {
+				filtered = append(filtered, e)
+			}
+		}
+		m.Entries = filtered
+		m.Count = len(filtered)
+		m.OnDisk = 0
+		for _, e := range filtered {
+			if e.OnDisk {
+				m.OnDisk++
+			}
+		}
+	}
+	bad := 0
+	for _, e := range m.Entries {
+		if e.Verified != nil && !*e.Verified {
+			bad++
+		}
+	}
+	emit(map[string]any{"ok": bad == 0, "checked": m.Count, "on_disk": m.OnDisk,
+		"mismatches": bad, "entries": m.Entries, "duration_ms": m.DurationMS})
+	if bad > 0 {
+		os.Exit(1)
+	}
+}
+
+// runRead emits a bounded excerpt to stdout as plain text (not JSON) so the
+// agent can pipe it into grep/python or read just the lines it needs.
+func runRead(args []string) {
+	fs := flag.NewFlagSet("read", flag.ExitOnError)
+	targetF := fs.String("target", "", "local file to read")
+	patternF := fs.String("grep", "", "emit lines matching this regex")
+	contextF := fs.Int("context", 0, "lines before/after each match")
+	headF := fs.Int("head", 0, "first N lines")
+	tailF := fs.Int("tail", 0, "last N lines")
+	maxF := fs.Int64("max-bytes", core.DefaultReadMax, "hard cap on output bytes")
+	_ = fs.Parse(args)
+	if *targetF == "" {
+		fmt.Fprintln(os.Stderr, "read needs --target PATH")
+		os.Exit(2)
+	}
+	text, err := core.ReadFileSlice(*targetF, core.ReadOptions{
+		Pattern: *patternF, Context: *contextF, Head: *headF,
+		Tail: *tailF, MaxBytes: *maxF,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "read:", err)
+		os.Exit(1)
+	}
+	fmt.Print(text)
+}
+
 func runInstall() {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		os.Exit(1)
 	}
-	type target struct {
-		dir   string
+	// Primary skill is installed everywhere we detect, plus the legacy alias
+	// so agents that already learned `fetch` keep working after an upgrade.
+	agents := []struct {
+		base  string
 		label string
 		force bool
+	}{
+		{filepath.Join(home, ".config", "opencode", "skills"), "opencode (global)", true},
+		{filepath.Join(home, ".claude", "skills"), "claude code", dirExists(filepath.Join(home, ".claude"))},
+		{filepath.Join(home, ".codex", "skills"), "codex", dirExists(filepath.Join(home, ".codex"))},
+		{filepath.Join(home, ".zcode", "skills"), "zcode", dirExists(filepath.Join(home, ".zcode"))},
+		{filepath.Join(home, ".agents", "skills"), "agents", dirExists(filepath.Join(home, ".agents"))},
 	}
-	targets := []target{
-		{filepath.Join(home, ".config", "opencode", "skills", "fetch"), "opencode (global)", true},
-		{filepath.Join(home, ".claude", "skills", "fetch"), "claude code", dirExists(filepath.Join(home, ".claude"))},
-		{filepath.Join(home, ".zcode", "skills", "fetch"), "zcode", dirExists(filepath.Join(home, ".zcode"))},
-		{filepath.Join(home, ".agents", "skills", "fetch"), "agents", dirExists(filepath.Join(home, ".agents"))},
+	type target struct {
+		dir    string
+		label  string
+		force  bool
+		legacy bool
+	}
+	targets := []target{}
+	for _, a := range agents {
+		targets = append(targets,
+			target{filepath.Join(a.base, "opendrain"), a.label, a.force, false},
+			target{filepath.Join(a.base, "fetch"), a.label + " (legacy fetch)", a.force, true},
+		)
 	}
 	type installed struct {
 		Path string `json:"path"`
@@ -295,7 +425,15 @@ func runInstall() {
 			continue
 		}
 		dst := filepath.Join(t.dir, "SKILL.md")
-		if err := os.WriteFile(dst, skillMD, 0o644); err != nil {
+		content := skillMD
+		if t.legacy {
+			// Never overwrite an agent's own customized fetch skill.
+			if _, err := os.Stat(dst); err == nil {
+				continue
+			}
+			content = legacySkillMD
+		}
+		if err := os.WriteFile(dst, content, 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "skip %s: %v\n", t.label, err)
 			continue
 		}

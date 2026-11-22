@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -163,6 +164,100 @@ func TestFileSha256KnownVector(t *testing.T) {
 	want := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 	if got != want {
 		t.Errorf("sha256(\"\")=%s, want %s", got, want)
+	}
+}
+
+func TestManifestReportsManagedFilesAndDiskState(t *testing.T) {
+	t.Setenv("OPENDRAIN_STATE_DIR", filepath.Join(t.TempDir(), "state"))
+	s, err := NewStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	present := filepath.Join(dir, "present.txt")
+	missing := filepath.Join(dir, "missing.txt")
+	if err := os.WriteFile(present, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	for _, tc := range []struct {
+		target string
+		sum    string
+	}{
+		{present, sum},
+		{present, "sha256:" + strings.Repeat("0", 64)},
+		{missing, sum},
+	} {
+		id := IDFor("http://x/"+filepath.Base(tc.target)+tc.sum, tc.target)
+		if err := s.Put(&State{ID: id, Status: StatusCompleted, Total: 5, Sha256: tc.sum,
+			Request:   Request{URL: "http://x/" + filepath.Base(tc.target), Target: tc.target},
+			CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m, err := s.Manifest(true, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Count != 3 || m.OnDisk != 2 {
+		t.Errorf("count=%d on_disk=%d, want 3/2", m.Count, m.OnDisk)
+	}
+	verified, mismatched, nofile := 0, 0, 0
+	for _, e := range m.Entries {
+		if e.Verified != nil && *e.Verified {
+			verified++
+		}
+		if e.Verified != nil && !*e.Verified {
+			mismatched++
+		}
+		if !e.OnDisk {
+			nofile++
+		}
+	}
+	if verified != 1 || mismatched != 1 || nofile != 1 {
+		t.Errorf("verified=%d mismatched=%d missing=%d, want 1/1/1", verified, mismatched, nofile)
+	}
+	found, err := s.FindByTarget(present)
+	if err != nil || found == nil {
+		t.Fatalf("FindByTarget failed: %v", err)
+	}
+	if none, err := s.FindByTarget(filepath.Join(dir, "never.txt")); err != nil || none != nil {
+		t.Errorf("unknown target should be nil,nil: %v %v", none, err)
+	}
+}
+
+func TestReadFileSliceModesAndBound(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "doc.txt")
+	body := "alpha one\nbeta target line\ncontext after\nfar away unrelated\ngamma\nlast target\n"
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	grepped, err := ReadFileSlice(p, ReadOptions{Pattern: "target", Context: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(grepped, "alpha one") || !strings.Contains(grepped, "context after") ||
+		!strings.Contains(grepped, "gamma") || !strings.Contains(grepped, "last target") ||
+		strings.Contains(grepped, "far away unrelated") {
+		t.Errorf("grep excerpt wrong: %q", grepped)
+	}
+
+	head, err := ReadFileSlice(p, ReadOptions{Head: 2})
+	if err != nil || !strings.HasPrefix(head, "alpha one\nbeta") {
+		t.Errorf("head wrong: %q %v", head, err)
+	}
+	tail, err := ReadFileSlice(p, ReadOptions{Tail: 1})
+	if err != nil || tail != "last target\n" {
+		t.Errorf("tail wrong: %q %v", tail, err)
+	}
+	bounded, err := ReadFileSlice(p, ReadOptions{MaxBytes: 9})
+	if err != nil || len(bounded) != 9 {
+		t.Errorf("max bytes not respected: %q (%d) %v", bounded, len(bounded), err)
+	}
+	if _, err := ReadFileSlice(p, ReadOptions{Pattern: "["}); err == nil {
+		t.Error("invalid regex should fail")
 	}
 }
 

@@ -9,6 +9,11 @@ import (
 	"strings"
 )
 
+// hashBufSize is deliberately larger than io.Copy's default 32KB: on a
+// cache hit we re-hash the whole target so the agent gets a digest of the
+// bytes actually on disk, and that hash is pure latency on the hot path.
+const hashBufSize = 1 << 20
+
 // ParseChecksum accepts only "sha256:<hex>".
 func ParseChecksum(s string) (algo, hexValue string, err error) {
 	algo, hexValue, ok := strings.Cut(s, ":")
@@ -38,7 +43,8 @@ func FileSha256(path string) (string, error) {
 	}
 	defer f.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	buf := make([]byte, hashBufSize)
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil

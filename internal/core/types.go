@@ -71,6 +71,7 @@ type State struct {
 	Chunks    []Chunk     `json:"chunks,omitempty"`
 	Sha256    string      `json:"sha256,omitempty"`
 	Probes    []ProbeInfo `json:"mirrors_probed,omitempty"`
+	ProbedAt  time.Time   `json:"probed_at,omitempty"`
 	Selected  string      `json:"selected_mirror,omitempty"`
 	Error     *ErrInfo    `json:"error,omitempty"`
 	Warnings  []string    `json:"warnings,omitempty"`

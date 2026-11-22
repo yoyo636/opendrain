@@ -19,7 +19,14 @@ const (
 	attemptsPerURL = 3
 	maxConns       = 6
 	minRangedSize  = 8 << 20
-	targetChunk    = 16 << 20
+	// Chunk sizing drives real throughput: with 16MB chunks a 28MB file only
+	// got two connections, which lost to curl on throttled hosts. Aim for
+	// ~2MB per connection so mid-size files can actually saturate a link,
+	// while capping concurrency so we don't hammer small servers.
+	targetChunk    = 2 << 20
+	maxChunks      = 16
+	minChunkSize   = 1 << 20
+	copyBufferSize = 512 << 10
 )
 
 // Native is the zero-dependency fallback downloader: concurrent Range
@@ -192,16 +199,20 @@ func planDownload(ctx context.Context, st *core.State, f *os.File) (dlPlan, erro
 			}
 			return dlPlan{mode: core.ModeSingle, total: total, chunks: []core.Chunk{{Start: 0, End: end}}}, nil
 		}
-		n := int(total / targetChunk)
+		n := 1
 		if total >= minRangedSize {
-			if n > 8 {
-				n = 8
+			// round up so a 28MB file gets 14 chunks instead of 2
+			n = int((total + targetChunk - 1) / targetChunk)
+			if n > maxChunks {
+				n = maxChunks
 			}
 			if n < 2 {
 				n = 2
 			}
-		} else {
-			n = 1
+			// never create sub-1MB chunks: request overhead would eat the gain
+			if byMin := int(total / minChunkSize); n > byMin && byMin > 1 {
+				n = byMin
+			}
 		}
 		chunks := makeChunks(total, n)
 		st.Mode, st.Chunks, st.Total, st.Done = core.ModeRanged, chunks, total, 0
@@ -342,7 +353,7 @@ func truncateSnippet(b []byte) string {
 var errFatal = errors.New("fatal")
 
 func copyChunk(f *os.File, body io.Reader, start, remaining int64, prog *progress, idx int) (int64, error) {
-	buf := make([]byte, 128<<10)
+	buf := make([]byte, copyBufferSize)
 	var written int64
 	for remaining < 0 || written < remaining {
 		toRead := len(buf)

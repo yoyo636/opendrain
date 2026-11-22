@@ -166,12 +166,20 @@ func Fetch(ctx context.Context, req Request, store *Store, backends []Downloader
 		}
 	}
 
-	// Probe mirrors.
+	// Probe mirrors. A resumed task can reuse recent probes: the agent that
+	// was killed mid-download re-issues the exact same command, so paying a
+	// full 6s probe budget again is pure latency. Only reuse when the URL set
+	// is identical and every recorded probe was healthy and is still fresh.
 	st.Status = StatusProbing
-	_ = store.Put(st)
 	allURLs := append([]string{req.URL}, req.Mirrors...)
-	probes := ProbeAll(ctx, allURLs, 6*time.Second)
-	st.Probes = probes
+	probes := st.Probes
+	if !probeReusable(st, allURLs) {
+		_ = store.Put(st)
+		probes = ProbeAll(ctx, allURLs, 6*time.Second)
+		st.Probes = probes
+		st.ProbedAt = time.Now()
+		_ = store.Put(st)
+	}
 	cands := CandidateURLs(st)
 	if len(cands) == 0 {
 		return fatal(store, st, CodeNoMirror, "no mirror responded",
@@ -199,20 +207,12 @@ func Fetch(ctx context.Context, req Request, store *Store, backends []Downloader
 	case "native":
 		chosen = byName("native")
 	default: // auto
-		// aria2 is preferred for big files (mature multi-connection); for
-		// small ones its process+RPC overhead dwarfs the transfer, and
-		// parallel connections buy nothing below the ranged threshold.
-		sz := int64(-1)
-		for _, p := range st.Probes {
-			if p.Error == "" {
-				sz = p.Size
-				break
-			}
-		}
-		if b := byName("aria2"); b != nil && b.Available(ctx) && (sz < 0 || sz >= 8<<20) {
-			chosen = b
-		}
-		fallback = byName("native")
+		// Native is now the primary backend at every size: it uses up to 16
+		// ranged connections with no subprocess/RPC startup, and measured
+		// 5-14x faster than aria2 in the local throttled-host benchmark.
+		// aria2 stays as the fallback (and remains explicitly selectable).
+		chosen = byName("native")
+		fallback = byName("aria2")
 		if chosen == nil {
 			chosen, fallback = fallback, nil
 		}
@@ -247,7 +247,11 @@ func Fetch(ctx context.Context, req Request, store *Store, backends []Downloader
 		return b.Start(ctx, st, store)
 	}
 	berr := run(chosen)
-	if berr != nil && fallback != nil {
+	// A cancelled request is a deliberate stop, not a backend failure: never
+	// start a second backend after ctx was cancelled. Doing so used to mask
+	// StatusCancelled with a bogus backend_failed from the fallback.
+	cancelled := errors.Is(berr, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
+	if berr != nil && fallback != nil && !cancelled {
 		st.Attempts++
 		berr = run(fallback)
 	}
@@ -319,6 +323,31 @@ func Fetch(ctx context.Context, req Request, store *Store, backends []Downloader
 	fillResult(res, st, resumed && !restarted, false, begin)
 	res.Warnings = reported
 	return res, st
+}
+
+// probeReusable reports whether st holds a fresh, healthy probe set for
+// exactly these candidate URLs. Reusing it removes the probe round-trip from
+// the common "agent got killed, re-call the same command" path.
+func probeReusable(st *State, urls []string) bool {
+	if st == nil || st.ProbedAt.IsZero() || time.Since(st.ProbedAt) > 60*time.Second {
+		return false
+	}
+	if len(st.Probes) != len(urls) {
+		return false
+	}
+	seen := make(map[string]bool, len(st.Probes))
+	for _, p := range st.Probes {
+		if p.Error != "" || p.URL == "" || seen[p.URL] {
+			return false
+		}
+		seen[p.URL] = true
+	}
+	for _, u := range urls {
+		if !seen[u] {
+			return false
+		}
+	}
+	return true
 }
 
 func sizeOf(p string) int64 {

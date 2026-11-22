@@ -50,8 +50,8 @@ func TestFetchChunkedCompletesWithSha(t *testing.T) {
 	if st.Mode != core.ModeRanged {
 		t.Errorf("expected ranged mode, got %s", st.Mode)
 	}
-	if len(st.Chunks) < 2 {
-		t.Errorf("expected >=2 chunks for 10MB, got %d", len(st.Chunks))
+	if len(st.Chunks) < 4 {
+		t.Errorf("expected >=4 chunks for 10MB (2MB target), got %d", len(st.Chunks))
 	}
 	got, err := os.ReadFile(target)
 	if err != nil || len(got) != len(data) {

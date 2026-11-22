@@ -84,7 +84,7 @@ func (a *Aria2) Start(ctx context.Context, st *core.State, store *core.Store) er
 			// die together with us: no orphaned downloader left behind
 			"--stop-with-process=" + strconv.Itoa(os.Getpid()),
 			"--continue=true", "--allow-overwrite=true", "--auto-file-renaming=false",
-			"--file-allocation=none", "--max-connection-per-server=8", "--split=8",
+			"--file-allocation=none", "--max-connection-per-server=16", "--split=16",
 			"--min-split-size=1M", "--summary-interval=0", "--quiet=true",
 			"--user-agent=" + core.UserAgent,
 		}

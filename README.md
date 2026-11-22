@@ -48,7 +48,7 @@ opendrain status --url URL --target PATH
 opendrain clean (--url URL --target PATH | --id ID | --all)
 ```
 
-- 结果：stdout 一行 JSON（`ok / status / bytes / sha256 / backend / selected_mirror / resumed / warnings / error{code}`）。
+- 结果：stdout 一份结构化 JSON（`ok / status / bytes / sha256 / backend / selected_mirror / resumed / warnings / error{code}`）。
 - 目标路径只出现完整且校验过的文件——下载中字节在 `<target>.part`，校验通过后原子改名。
 - 任何中断后**重调同一命令即续传**；状态在 `~/.opendrain/state/<sha256(url|target)>.json`。
 - 相对路径与绝对路径指向同一目标时 ID 相同，`fetch` / `status` 始终算出同一个任务。
@@ -70,7 +70,7 @@ internal/backend
   native.go                  纯 Go fallback：分片并发、逐 chunk 续传、30s stall 检测、镜像故障切换
 ```
 
-- **auto 路由**：已知大小 <8MB → native（aria2 进程开销不划算）；否则 aria2 可用即用，不可用回退 native。
+- **auto 路由**：native 优先（2MB 分片、最多 16 连接、零进程开销）；aria2 作为 fallback，也可用 `--backend aria2` 显式选择。
 - **镜像**：探测排序（可达 > 支持 Range > TTFB 低）；主源中途失败自动切次优并保留已下载分片。
 - **跨后端切换**：native 与 aria2 的残片格式不兼容，切换时作废旧残片诚实重下（防止把稀疏空洞当代价最优——见 BENCHMARK.md 场景 3b 的真实案例）。
 

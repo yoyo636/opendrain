@@ -115,3 +115,29 @@ mirrors.ustc.edu.cn/golang/…           latency_ms: 432  range: true  status: 2
 - 小文件上 aria2 的进程开销明显（4.1s vs native 0.85s）——auto 模式已对 <8MB 文件自动路由 native；更大优化空间留给后续迭代。
 - 本网络路径下多连接未跑赢 curl 单连接（见场景 2 说明）；速度收益依赖真实瓶颈是"单连接带宽"的路径。
 - webfetch 的 token 消耗只能按结果字符数估算（底层管道成本不可见），已标注方法学。
+
+---
+
+## 2026-11-22 性能优化：分片与探测复用
+
+**方法**：本地 Range 服务器，每连接限速 12 MB/s（模拟 single-connection throttled host，即多连接真正能获益的场景）。每档跑 2 次取最优，每次清空状态与目标文件。二进制用 `CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 -trimpath -ldflags="-s -w"` 编译。
+
+| 文件 | 优化前 native | 优化后 native | curl 单连接 | 相对 curl 的加速比（前 → 后） |
+|---|---|---|---|---|
+| 28 MB | 1.231 s（**2 分片**） | **0.254 s**（14 分片） | 2.349 s | 1.91× → **9.25×** |
+| 100 MB | 1.551 s（8 分片） | **0.733 s**（16 分片） | 8.348 s | 5.38× → **11.4×** |
+
+**做了什么**
+
+1. `targetChunk` 16MB → 2MB、上限 8 → 16，且不允许 <1MB 的碎片。28MB 文件从 2 分片变 14 分片。
+2. `copyChunk` 缓冲区 128KB → 512KB；`FileSha256` 用 1MB 显式缓冲替代 `io.Copy` 默认 32KB。
+3. 续传时复用 60 秒内、URL 集合一致且全部健康的探测结果 —— 跳过 6 秒探测预算，这是"Agent 被杀后重调同一命令"的响应延迟大头。
+4. auto 路由改为优先 native：本机实测 native 0.254/0.733 s vs aria2 3.545/4.009 s（aria2 进程+RPC 开销与 8 连接限制），原先 auto 选 aria2 反而慢 5–14×。aria2 提到 16 连接并保留为 fallback 与显式选项。
+5. 修正取消语义：ctx 被取消时不再启动 fallback 后端（原先会把 `cancelled` 覆盖成误导性的 `backend_failed`）。
+
+**没有做**
+
+- 缓存命中不改成 size+mtime 快速路径：虽然能省 ~70ms（100MB），但那会让 Agent 拿到"记录里的 digest"而不是"磁盘上字节的 digest"，违背校验设计原则。
+- 没有无限提高并发：16 是实测收益与"不锤小服务器"之间的折中；链路已饱和时更多连接无增益（见场景 2）。
+
+**已知限制**：本测试是单机回环 + 服务端限速，反映的是 per-connection throttled 场景；链路饱和或服务器不支持 Range 时不适用，请按场景 2 的方法先判瓶颈。

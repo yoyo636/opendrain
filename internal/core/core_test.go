@@ -201,6 +201,34 @@ func TestTaskLockSerializesAndReleases(t *testing.T) {
 	relAgain()
 }
 
+func TestProbeReusableOnlyForFreshHealthySameURLSet(t *testing.T) {
+	now := time.Now()
+	good := []ProbeInfo{{URL: "http://x/a", Status: 206, RangeOK: true}}
+	st := &State{Probes: good, ProbedAt: now}
+	if !probeReusable(st, []string{"http://x/a"}) {
+		t.Error("fresh healthy probe for the same URL should be reusable")
+	}
+	if probeReusable(st, []string{"http://x/b"}) {
+		t.Error("a different URL must not reuse another URL's probe")
+	}
+	if probeReusable(st, []string{"http://x/a", "http://x/b"}) {
+		t.Error("a changed mirror set must not reuse stale probes")
+	}
+
+	dead := &State{Probes: []ProbeInfo{{URL: "http://x/a", Error: "timeout"}}, ProbedAt: now}
+	if probeReusable(dead, []string{"http://x/a"}) {
+		t.Error("failed probe must never be reused")
+	}
+	stale := &State{Probes: good, ProbedAt: now.Add(-2 * time.Minute)}
+	if probeReusable(stale, []string{"http://x/a"}) {
+		t.Error("probe older than 60s must not be reused")
+	}
+	dup := &State{Probes: append(append([]ProbeInfo{}, good...), good...), ProbedAt: now}
+	if probeReusable(dup, []string{"http://x/a", "http://x/a"}) {
+		t.Error("duplicate probe URLs must not be treated as healthy")
+	}
+}
+
 func TestCachedChecksumMismatchQuarantinesInsteadOfDeleting(t *testing.T) {
 	t.Setenv("OPENDRAIN_STATE_DIR", filepath.Join(t.TempDir(), "state"))
 	s, err := NewStore()

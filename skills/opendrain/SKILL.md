@@ -142,10 +142,12 @@ opendrain install
 ```
 
 Installs this skill as `SKILL.md` into every detected agent config:
-OpenCode (`~/.config/opencode/skills/opendrain`), Claude Code
+OpenCode (`~/.config/opencode/skills/opendrain`), WorkBuddy
+(`~/.workbuddy/skills/opendrain`), Claude Code
 (`~/.claude/skills/opendrain`), Codex (`~/.codex/skills/opendrain`),
-and `~/.agents/skills/opendrain`. The binary is copied to `~/.local/bin` if
-it is not already on PATH.
+zcode, and `~/.agents/skills/opendrain`. The binary is copied to
+`~/.local/bin` if it is not already on PATH. WorkBuddy rescans its skills
+directory on next session start; no manual cache edit is needed.
 
 ## Notes
 

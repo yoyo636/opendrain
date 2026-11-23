@@ -393,6 +393,7 @@ func runInstall() {
 		force bool
 	}{
 		{filepath.Join(home, ".config", "opencode", "skills"), "opencode (global)", true},
+		{filepath.Join(home, ".workbuddy", "skills"), "workbuddy", dirExists(filepath.Join(home, ".workbuddy"))},
 		{filepath.Join(home, ".claude", "skills"), "claude code", dirExists(filepath.Join(home, ".claude"))},
 		{filepath.Join(home, ".codex", "skills"), "codex", dirExists(filepath.Join(home, ".codex"))},
 		{filepath.Join(home, ".zcode", "skills"), "zcode", dirExists(filepath.Join(home, ".zcode"))},

@@ -397,6 +397,9 @@ func runInstall() {
 		{filepath.Join(home, ".claude", "skills"), "claude code", dirExists(filepath.Join(home, ".claude"))},
 		{filepath.Join(home, ".codex", "skills"), "codex", dirExists(filepath.Join(home, ".codex"))},
 		{filepath.Join(home, ".zcode", "skills"), "zcode", dirExists(filepath.Join(home, ".zcode"))},
+		{filepath.Join(home, ".gemini", "skills"), "gemini cli", dirExists(filepath.Join(home, ".gemini"))},
+		{filepath.Join(home, ".cline", "skills"), "cline", dirExists(filepath.Join(home, ".cline"))},
+		{filepath.Join(home, ".kilo", "skills"), "kilo", dirExists(filepath.Join(home, ".kilo"))},
 		{filepath.Join(home, ".agents", "skills"), "agents", dirExists(filepath.Join(home, ".agents"))},
 	}
 	type target struct {

@@ -39,12 +39,15 @@ func NormalizeTarget(target string) (string, error) {
 
 // IDFor keys a download by url+target: re-calling with the same arguments
 // finds the same state file and resumes.
-func IDFor(url, target string) string {
+func IDFor(rawURL, target string) string {
 	t, err := NormalizeTarget(target)
 	if err != nil {
 		t = filepath.Clean(target)
 	}
-	h := sha256.Sum256([]byte(url + "\n" + t))
+	// Presigned GitHub URLs rotate their signature every hour; keying on the
+	// raw URL would turn a refreshed link into a brand-new task and throw away
+	// resumable bytes. CanonicalURL is a no-op for non-GitHub URLs.
+	h := sha256.Sum256([]byte(CanonicalURL(rawURL) + "\n" + t))
 	return hex.EncodeToString(h[:])
 }
 

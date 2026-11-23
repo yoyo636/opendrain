@@ -27,6 +27,9 @@ const (
 	maxChunks      = 16
 	minChunkSize   = 1 << 20
 	copyBufferSize = 512 << 10
+	// GitHub CDN paths are throttled and jittery; keep ranged resume (vital
+	// for GB-scale assets) but use a conservative connection count there.
+	githubMaxChunks = 4
 )
 
 // Native is the zero-dependency fallback downloader: concurrent Range
@@ -37,17 +40,19 @@ type Native struct {
 }
 
 func NewNative() *Native {
+	base := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   maxChunks,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
 	return &Native{Client: &http.Client{
-		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			MaxIdleConns:          64,
-			MaxIdleConnsPerHost:   maxConns,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-		},
+		Transport:     core.WrapGitHubAuth(base),
+		CheckRedirect: core.SafeRedirectPolicy,
 	}}
 }
 
@@ -182,6 +187,10 @@ func planDownload(ctx context.Context, st *core.State, f *os.File) (dlPlan, erro
 	}
 	total := probe.Size // -1 = unknown
 	ranged := probe.RangeOK
+	// GitHub's signed CDN redirects showed highly unstable per-connection
+	// throughput; 16-way splitting amplifies that jitter. Keep ranged resume
+	// (essential for GB-scale assets) but cap concurrency for GitHub hosts.
+	github := core.UseSingleStream(st.Request.URL)
 	partSize := fileStats(f)
 
 	fresh := func() (dlPlan, error) {
@@ -212,6 +221,9 @@ func planDownload(ctx context.Context, st *core.State, f *os.File) (dlPlan, erro
 			// never create sub-1MB chunks: request overhead would eat the gain
 			if byMin := int(total / minChunkSize); n > byMin && byMin > 1 {
 				n = byMin
+			}
+			if github && n > githubMaxChunks {
+				n = githubMaxChunks
 			}
 		}
 		chunks := makeChunks(total, n)

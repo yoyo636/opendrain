@@ -6,6 +6,17 @@
 所以状态落盘可续传；它不"打开看看"，所以完整性必须强制校验；它不读设置面板，所以零配置；
 它调用下载的时机是代码执行中途，所以内容**永远不进 context**，只回一行 JSON。
 
+## GitHub 专项
+
+Agent 最常见的下载源是 GitHub，OpenDrain 对它做了专门处理：
+
+- **凭据自动获取、不落盘**：优先读 `GITHUB_TOKEN` / `GH_TOKEN`，否则调用 `gh auth token`。token 只作为内存中的 HTTP header 发给 `github.com` / `api.github.com`；一旦重定向到 `release-assets.githubusercontent.com`，transport 会剥掉 Authorization，不会泄漏给 CDN。结果 JSON 与状态文件里都不含 token。
+- **短效签名 URL 可续传**：release asset 的 302 目标是带 `sig` / `se` / `jwt` 等参数的短效 URL（约 1 小时过期）。任务 ID 按剥离这些参数后的逻辑 URL 计算，链接刷新后重调同一命令仍能续传，不会丢分片。
+- **CDN 保守并发**：实测该路径到 GitHub CDN 的连接吞吐抖动极大（同一文件 4s…200s），16 路并发会放大抖动。GitHub 域名自动限制为最多 4 个分片，同时**保留分片续传**（GB 级模型权重必需），不做退回单流的倒退。
+- **安全重定向**：最多 10 跳，拒绝 https → http 降级。
+
+实测（本机路径，5.9MB release asset）：通用 16 分片 116.9s → GitHub 4 分片 **75.6s**（快 35%），字节与 curl 下载逐字节一致。注意这条路径本身到 GitHub CDN 很慢，curl 单连接也要 67s；代码优化的是"别让慢路径更慢"，不是物理带宽。
+
 ## Agent 会话生命周期
 
 OpenDrain 不只是下载器，而是 Agent 全程使用的文件层：

@@ -126,6 +126,18 @@ download: `fetch` self-heals by quarantining it and starting over.
 State lives in `~/.opendrain/state/<hash>.json` (hash of url + absolute target;
 relative and absolute paths map to the same hash).
 
+## GitHub URLs
+
+GitHub is a first-class source, not a generic URL:
+
+- Credentials come from `GITHUB_TOKEN` / `GH_TOKEN` or `gh auth token`; they
+  are only sent to `github.com` / `api.github.com` and are stripped on the
+  redirect to `release-assets.githubusercontent.com`.
+- Release asset links are short-lived signed redirects. Task identity ignores
+  rotating signature params, so re-calling after a link refresh still resumes.
+- Concurrency is capped at 4 chunks for GitHub hosts: measured CDN jitter made
+  16-way splitting slower. Range resume is retained for GB-scale assets.
+
 ## When NOT to use
 
 | Situation | Use instead |

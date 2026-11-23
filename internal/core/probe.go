@@ -21,15 +21,17 @@ const UserAgent = "opendrain/0.1"
 // Results are sorted best-first: reachable > range-capable > lowest latency;
 // stable sort keeps the caller's primary URL first on ties.
 func ProbeAll(ctx context.Context, urls []string, timeout time.Duration) []ProbeInfo {
+	base := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: timeout,
+		MaxIdleConns:          len(urls) + 1,
+	}
 	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
-			TLSHandshakeTimeout:   5 * time.Second,
-			ResponseHeaderTimeout: timeout,
-			MaxIdleConns:          len(urls) + 1,
-		},
+		Timeout:       timeout,
+		Transport:     WrapGitHubAuth(base),
+		CheckRedirect: SafeRedirectPolicy,
 	}
 	results := make([]ProbeInfo, len(urls))
 	var wg sync.WaitGroup

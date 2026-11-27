@@ -59,6 +59,31 @@ func chunkSum(cs []Chunk) int64 {
 	return s
 }
 
+func TestPutProgressIsAtomicAndReadable(t *testing.T) {
+	t.Setenv("OPENDRAIN_STATE_DIR", filepath.Join(t.TempDir(), "state"))
+	s, err := NewStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := IDFor("http://x/big", "/tmp/big")
+	if err := s.Put(&State{ID: id, Status: StatusDownloading, Done: 10, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	for i := int64(11); i <= 30; i++ {
+		if err := s.PutProgress(&State{ID: id, Status: StatusDownloading, Done: i, CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Get(id)
+		if err != nil || got == nil || got.Done != i {
+			t.Fatalf("progress %d lost: %v %+v", i, err, got)
+		}
+	}
+	// no .tmp left behind, and the state file is complete JSON
+	if _, err := os.Stat(s.Path(id) + ".tmp"); !os.IsNotExist(err) {
+		t.Errorf("temp file should not remain: %v", err)
+	}
+}
+
 func TestStorePutGetRoundTrip(t *testing.T) {
 	t.Setenv("OPENDRAIN_STATE_DIR", filepath.Join(t.TempDir(), "state"))
 	s, err := NewStore()

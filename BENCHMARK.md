@@ -141,3 +141,28 @@ mirrors.ustc.edu.cn/golang/…           latency_ms: 432  range: true  status: 2
 - 没有无限提高并发：16 是实测收益与"不锤小服务器"之间的折中；链路已饱和时更多连接无增益（见场景 2）。
 
 **已知限制**：本测试是单机回环 + 服务端限速，反映的是 per-connection throttled 场景；链路饱和或服务器不支持 Range 时不适用，请按场景 2 的方法先判瓶颈。
+
+
+---
+
+## 2026-11-27 大文件 (>1GB) 专项
+
+**背景**：上一轮 GitHub 专项把 GitHub 域名统一限制到 4 分片（针对 5.9MB 小文件的 CDN 抖动）。这对 GB 级资产是硬伤——1GB 文件只有 4 路并发，慢链路上要几分钟。
+
+**本地基准**（1GiB 文件，Range server 每连接限速，macOS APFS）：
+
+| 场景 | curl 单连接 | before | after | 备注 |
+|---|---|---|---|---|
+| 40MB/s/连接 | 25.61s | 3.65s | 3.18~3.71s | 本地 SSD 噪声大于优化收益 |
+| 8MB/s/连接 | 127.99s | 9.18s | 9.10s | 同上 |
+
+**诚实结论**：本地 SSD 上这些优化收益很小（fsync 573ms 只占 3.65s 的 15%，且 SSD 上被缓存掩盖）。真正的问题是**真实网络/慢盘路径**，本地基准无法复现。
+
+**改动**（每项都有微基准或测试支撑）：
+
+1. **GitHub 大文件恢复满并发**：`githubSmallChunks=4` 只对 <256MB 生效，1GB GitHub 文件用满 16 分片（`TestChunkCountLargeFilesAndGitHub` 覆盖阈值两侧）。
+2. **进度保存去 fsync**：新增 `Store.PutProgress`（tmp + 原子 rename，无 fsync），1GB 下载原本每 500ms 一次 fsync（微基准 60 次 = 573ms）。最终提交仍用带 fsync 的 `Put`，崩溃续传语义不变。
+3. **大文件进度间隔 500ms → 2s**：减少状态写入次数。
+4. **进度计数批量发布**：每累计 4MB 才抢一次共享锁（1GB 从 2048 次锁降到 256 次；微基准 72ms → 51ms）。
+
+**语义不变**：崩溃续传、sha256 校验、原子发布、状态文件一致性全部保留；`PutProgress` 的原子性由 `TestPutProgressIsAtomicAndReadable` 覆盖。

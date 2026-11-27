@@ -27,9 +27,17 @@ const (
 	maxChunks      = 16
 	minChunkSize   = 1 << 20
 	copyBufferSize = 512 << 10
-	// GitHub CDN paths are throttled and jittery; keep ranged resume (vital
-	// for GB-scale assets) but use a conservative connection count there.
-	githubMaxChunks = 4
+	// GitHub CDN paths are throttled and jittery for small files, so keep a
+	// conservative cap there — but GB-scale assets need real concurrency or
+	// a 4-way download takes many minutes. The cap lifts automatically.
+	githubSmallChunks = 4
+	githubLargeSize   = 256 << 20
+	// Accumulate progress locally and publish to the shared counter in
+	// batches: a 1GiB/512KB download otherwise takes 2048 contended locks.
+	progressBatch = 4 << 20
+	// Progress snapshots do not need fsync or 500ms granularity on big files.
+	smallProgressInterval = 500 * time.Millisecond
+	largeProgressInterval = 2 * time.Second
 )
 
 // Native is the zero-dependency fallback downloader: concurrent Range
@@ -121,7 +129,11 @@ func (n *Native) Start(ctx context.Context, st *core.State, store *core.Store) e
 	saverWG.Add(1)
 	go func() {
 		defer saverWG.Done()
-		t := time.NewTicker(500 * time.Millisecond)
+		interval := smallProgressInterval
+		if plan.total >= githubLargeSize {
+			interval = largeProgressInterval
+		}
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {
@@ -208,24 +220,7 @@ func planDownload(ctx context.Context, st *core.State, f *os.File) (dlPlan, erro
 			}
 			return dlPlan{mode: core.ModeSingle, total: total, chunks: []core.Chunk{{Start: 0, End: end}}}, nil
 		}
-		n := 1
-		if total >= minRangedSize {
-			// round up so a 28MB file gets 14 chunks instead of 2
-			n = int((total + targetChunk - 1) / targetChunk)
-			if n > maxChunks {
-				n = maxChunks
-			}
-			if n < 2 {
-				n = 2
-			}
-			// never create sub-1MB chunks: request overhead would eat the gain
-			if byMin := int(total / minChunkSize); n > byMin && byMin > 1 {
-				n = byMin
-			}
-			if github && n > githubMaxChunks {
-				n = githubMaxChunks
-			}
-		}
+		n := chunkCount(total, github)
 		chunks := makeChunks(total, n)
 		st.Mode, st.Chunks, st.Total, st.Done = core.ModeRanged, chunks, total, 0
 		_ = f.Truncate(total)
@@ -367,6 +362,14 @@ var errFatal = errors.New("fatal")
 func copyChunk(f *os.File, body io.Reader, start, remaining int64, prog *progress, idx int) (int64, error) {
 	buf := make([]byte, copyBufferSize)
 	var written int64
+	var pending int64 // not yet published to the shared progress counter
+	publish := func() {
+		if pending > 0 {
+			prog.addChunk(idx, pending)
+			pending = 0
+		}
+	}
+	defer publish() // never lose the tail on a clean return
 	for remaining < 0 || written < remaining {
 		toRead := len(buf)
 		if remaining > 0 && int64(toRead) > remaining-written {
@@ -378,7 +381,10 @@ func copyChunk(f *os.File, body io.Reader, start, remaining int64, prog *progres
 				return written, fmt.Errorf("%w: writing part file: %v", errFatal, we)
 			}
 			written += int64(nr)
-			prog.addChunk(idx, int64(nr))
+			pending += int64(nr)
+			if pending >= progressBatch {
+				publish()
+			}
 		}
 		if er == io.EOF {
 			return written, nil
@@ -469,7 +475,33 @@ func saveProgress(st *core.State, store *core.Store, prog *progress, plan dlPlan
 	} else {
 		cp.Chunks = nil
 	}
-	_ = store.Put(&cp)
+	_ = store.PutProgress(&cp)
+}
+
+// chunkCount decides concurrency from file size and host. Kept pure so the
+// large-file / GitHub small-file rules can be tested without a network.
+func chunkCount(total int64, github bool) int {
+	if total < minRangedSize {
+		return 1
+	}
+	// round up so a 28MB file gets 14 chunks instead of 2
+	n := int((total + targetChunk - 1) / targetChunk)
+	if n > maxChunks {
+		n = maxChunks
+	}
+	if n < 2 {
+		n = 2
+	}
+	// never create sub-1MB chunks: request overhead would eat the gain
+	if byMin := int(total / minChunkSize); n > byMin && byMin > 1 {
+		n = byMin
+	}
+	// GitHub's CDN is jittery for small files (16-way was slower), but a
+	// GB-scale asset needs full concurrency — a 4-way 1GB download is minutes.
+	if github && total < githubLargeSize && n > githubSmallChunks {
+		n = githubSmallChunks
+	}
+	return n
 }
 
 func makeChunks(total int64, n int) []core.Chunk { return core.MakeChunks(total, n) }

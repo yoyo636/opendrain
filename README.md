@@ -103,6 +103,13 @@ CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="-s -w -X ma
 
 或推 `v*` tag 触发 `.github/workflows/release.yml` 自动构建 5 个平台、生成 `SHA256SUMS` 并发布 Release。
 
+### 维护者发布流程
+
+1. 同步 `main.go` 的 `version`、`package.json` 的 `version`（当前 `0.2.0`）。
+2. `git tag vX.Y.Z && git push origin main vX.Y.Z`；Actions 在 Linux runner 上交叉编译 5 个平台并上传 `SHA256SUMS`。
+3. npm：在仓库配置 `NPM_TOKEN` secret 后，`npm-publish` workflow 会在 Release 发布时自动 `npm publish`（也可手动 `workflow_dispatch`）；或在本地 `npm login && npm publish --access public`。
+4. 用 `shasum -a 256 -c SHA256SUMS` 校验产物，再 `opendrain install` 更新各 agent 的 skill。
+
 ## 使用
 
 ```sh

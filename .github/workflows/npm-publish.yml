@@ -1,0 +1,32 @@
+name: npm-publish
+
+# Publishing to npm requires an NPM_TOKEN repository secret (an npm
+# automation/granular token with publish rights for the opendrain package).
+# Without it the job is a no-op so a release never fails just because npm
+# credentials have not been configured yet.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Publish if NPM_TOKEN is configured
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN secret is not configured; skipping npm publish."
+            exit 0
+          fi
+          npm publish --access public

@@ -169,6 +169,11 @@ go test ./...    # 45 个用例：分片/sha、取消续传、镜像故障切换
 
 真实场景数据见 [BENCHMARK.md](BENCHMARK.md)。
 
+## 文章
+
+- [Agent 缺的不是下载器，是下载层](articles/why-agents-need-a-download-layer.md)（中文）——为什么 Agent 需要一套不同的文件 I/O 契约。
+- [Agents Don't Need a Better Downloader. They Need a Download Layer.](articles/why-agents-need-a-download-layer.en.md) (English) — the same argument in English.
+
 ## 可靠性修复（2026-11-28）
 
 > 更早的 2026-10-30 / 11-04 修复（探针不信 `Accept-Ranges`、`resumed` 不虚报、相对路径 ID 归一化、状态损坏自愈、全流程 flock）仍在，回归用例保留。

@@ -130,3 +130,42 @@ returns: handle{id, target, bytes, sha256, integrity, resumed, cached, status, w
 OpenDrain 是 DAL 的参考实现。`core.Fetch` 就是 `Act` 的完整语义；CLI、npm launcher、各 agent skill 只是不同的调用外壳。
 
 换句话说：以前我们把 skill 当成产品；现在 skill 只是 DAL 的一种**适配层**。产品是那条下载行动总线本身。
+
+---
+
+## 接入你的机器：MCP 适配器
+
+项目附带 `cmd/opendrain-mcp`：一个零依赖的 MCP server，把 DAP 暴露成 4 个工具
+（`download` / `manifest` / `verify` / `read_excerpt`）。它自己启动 `opendrain dap`
+子进程，所以 Agent 侧只需要配置一条命令。
+
+安装（在当前机器上已完成）：
+
+```sh
+go build -trimpath -ldflags="-s -w -X main.version=0.3.0" -o ~/.local/bin/opendrain .
+go build -trimpath -ldflags="-s -w" -o ~/.local/bin/opendrain-mcp ./cmd/opendrain-mcp
+```
+
+注册到各 Agent（CLI 支持内建命令的优先用它）：
+
+```sh
+claude mcp add --scope user opendrain-dal -- ~/.local/bin/opendrain-mcp
+codex mcp add opendrain-dal -- ~/.local/bin/opendrain-mcp
+opencode mcp add opendrain-dal -- ~/.local/bin/opendrain-mcp
+kilo mcp add opendrain-dal -- ~/.local/bin/opendrain-mcp
+```
+
+Gemini / Cline / WorkBuddy 直接在各自配置的 `mcpServers` 里加：
+`{"command": "~/.local/bin/opendrain-mcp", "args": []}`。
+
+zcode 通过本地插件加载：在 `~/.zcode/cli/plugins/cache/opendrain-dal/local/0.1.0/`
+放 `.zcode-plugin/plugin.json` 与 `.mcp.json`，内容同样是上面的 command。
+
+最后，Agent 还需要一条"只走这个工具"的指令。把下面的内容放进各 Agent 的全局
+指令文件（`~/.claude/CLAUDE.md`、`~/.codex/AGENTS.md`、`~/.config/opencode/AGENTS.md`
+等）：
+
+> All external file acquisition MUST go through the `opendrain-dal` MCP server's
+> `download` tool. Do NOT use curl, wget, or shell downloads. At session start call
+> `manifest`; before trusting a cached file call `verify`; use `read_excerpt` for
+> bounded inspection. Exception: git clone / webfetch summarization / interactive login.

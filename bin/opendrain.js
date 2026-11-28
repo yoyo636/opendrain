@@ -9,7 +9,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const { assetName, binaryPath, releaseUrls } = require('../lib/platform');
-const { download } = require('../lib/download');
+const { downloadVerified } = require('../lib/download');
 
 async function ensureBinary() {
   const dest = binaryPath();
@@ -21,7 +21,7 @@ async function ensureBinary() {
   for (const url of urls) {
     try {
       fs.mkdirSync(path.dirname(dest), { recursive: true });
-      await download(url, dest);
+      await downloadVerified(url, dest, assetName());
       console.error(`[opendrain] fetched ${assetName()}`);
       return dest;
     } catch (err) {

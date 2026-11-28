@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { assetName, binaryPath, releaseUrls } = require('../lib/platform');
-const { download } = require('../lib/download');
+const { downloadVerified } = require('../lib/download');
 
 async function main() {
   const asset = assetName();
@@ -25,7 +25,7 @@ async function main() {
   for (const url of urls) {
     try {
       fs.mkdirSync(path.dirname(dest), { recursive: true });
-      await download(url, dest);
+      await downloadVerified(url, dest, asset);
       console.log(`[opendrain] installed ${asset}`);
       return;
     } catch (err) {

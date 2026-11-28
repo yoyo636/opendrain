@@ -78,7 +78,8 @@ npm install -g opendrain      # 或直接 npx opendrain fetch --url ... --target
 opendrain install             # 把 skill 装进各 agent 的 skills 目录
 ```
 
-npm 包是零依赖的纯 JS 启动器：`postinstall` 从 GitHub Release 拉取当前平台的二进制；
+npm 包是零依赖的纯 JS 启动器：`postinstall` 从 GitHub Release 拉取当前平台的二进制，
+并用 Release 的 `SHA256SUMS` 校验（校验文件不可用时警告放行，校验不匹配则删除并拒绝）；
 拉取失败也不会让安装中断，launcher 会在首次运行时重试。包内同时附带两份 SKILL.md。
 
 > npm 12 起默认拦截依赖的安装脚本。若想在安装时就下载好二进制（省掉首次运行的等待）：

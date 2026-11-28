@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "OpenDrain Download Action Layer",
+    "description": "Routes every download through a resumable, checksum-verified agent file layer.",
+    "detail": "docs/DETAIL.md"
+  }
+}

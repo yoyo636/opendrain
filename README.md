@@ -123,6 +123,18 @@ CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="-s -w -X ma
 
 或推 `v*` tag 触发 `.github/workflows/release.yml` 自动构建 5 个平台、生成 `SHA256SUMS` 并发布 Release。
 
+### DeepSeek Harness（DSH）接入
+
+[dsh-bundle/opendrain-mcp/](dsh-bundle/opendrain-mcp/) 是一个配置型 DSH bundle：安装后把 OpenDrain 以 MCP 工具的形式挂进 agent（`mcp__opendrain__download` / `manifest` / `verify` / `read_excerpt`）。
+
+```sh
+# 先装含 DAP 的二进制（v0.3.0+）
+go build -trimpath -ldflags="-s -w -X main.version=0.3.0" -o ~/.local/bin/opendrain .
+go build -trimpath -ldflags="-s -w" -o ~/.local/bin/opendrain-mcp ./cmd/opendrain-mcp
+```
+
+然后在 DSH 里 **Plugins → Add plugin → 本地目录** 选中 `dsh-bundle/opendrain-mcp`。安装后新会话即可看到这四个工具。
+
 ### 维护者发布流程
 
 1. 同步 `main.go` 的 `version`、`package.json` 的 `version`（当前 `0.2.0`）。

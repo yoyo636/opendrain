@@ -1,0 +1,11 @@
+- insert:
+    - id: mcp-opendrain-dal
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: opendrain
+        transport: stdio
+        command: /Users/wuyuanduo/.local/bin/opendrain-mcp
+        args: []
+        startupTimeoutMs: 30000
+        toolCallTimeoutMs: 600000
+        failOnStartupError: false

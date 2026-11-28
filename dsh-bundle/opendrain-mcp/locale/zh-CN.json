@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "OpenDrain 下载行动层",
+    "description": "把每一次下载都交给可续传、带校验的 Agent 文件层处理。",
+    "detail": "docs/DETAIL.md"
+  }
+}

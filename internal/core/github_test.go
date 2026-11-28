@@ -109,3 +109,58 @@ func TestSafeRedirectPolicyCapsAndRefusesDowngrade(t *testing.T) {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestCanonicalURLHandlesHuggingFaceRotatingSignatures(t *testing.T) {
+	a := "https://cas-bridge.xethub.hf.co/xet-bridge-us/abc/blob" +
+		"?Expires=1&Policy=p1&Signature=s1&Key-Pair-Id=k&xip=u&download=true"
+	b := "https://cas-bridge.xethub.hf.co/xet-bridge-us/abc/blob" +
+		"?Expires=2&Policy=p2&Signature=s2&Key-Pair-Id=k&xip=u&download=true"
+	if CanonicalURL(a) != CanonicalURL(b) {
+		t.Errorf("HF/xet signature refresh must not change identity: %q vs %q", CanonicalURL(a), CanonicalURL(b))
+	}
+	got := CanonicalURL(a)
+	if strings.Contains(got, "Signature=") || strings.Contains(got, "Expires=") {
+		t.Errorf("signature params still present: %q", got)
+	}
+	if !strings.Contains(got, "download=true") {
+		t.Errorf("non-signature params must survive: %q", got)
+	}
+	other := "https://cas-bridge.xethub.hf.co/xet-bridge-us/abc/other?Expires=1&Signature=s1"
+	if CanonicalURL(a) == CanonicalURL(other) {
+		t.Error("different blob paths must stay different tasks")
+	}
+	plain := "https://example.org/f?sig=1&id=7"
+	if CanonicalURL(plain) != plain {
+		t.Errorf("unknown host must be unchanged: %q", CanonicalURL(plain))
+	}
+}
+
+func TestGitHubAuthResolvesTokenLazily(t *testing.T) {
+	calls := 0
+	tr := &githubAuthTransport{
+		base: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+		}),
+		resolve: func() string { calls++; return "TOK" },
+	}
+	do := func(raw string) {
+		req, _ := http.NewRequestWithContext(context.Background(), "GET", raw, nil)
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	do("https://example.org/file.bin")
+	if calls != 0 {
+		t.Errorf("non-GitHub request must not resolve a token, calls=%d", calls)
+	}
+	do("https://api.github.com/repos/a/b")
+	if calls != 1 {
+		t.Errorf("first GitHub request should resolve once, calls=%d", calls)
+	}
+	do("https://api.github.com/repos/a/b")
+	if calls != 1 {
+		t.Errorf("token must be cached, calls=%d", calls)
+	}
+}

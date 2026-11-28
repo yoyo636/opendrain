@@ -34,8 +34,11 @@ jobs:
       - name: Build
         shell: bash
         run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -trimpath -ldflags="-s -w" -o dist/${{ matrix.asset }} .
+            go build -trimpath -ldflags="-s -w -X main.version=$VERSION" \
+            -o dist/${{ matrix.asset }} .
 
       - uses: actions/upload-artifact@v4
         with:
@@ -50,6 +53,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          find . -type f ! -name SHA256SUMS -exec sha256sum {} \; \
+            | awk '{n=$2; sub(/.*\//,"",n); print $1"  "n}' \
+            | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create or update the GitHub release
         env:

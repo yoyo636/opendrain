@@ -160,9 +160,55 @@ mirrors.ustc.edu.cn/golang/…           latency_ms: 432  range: true  status: 2
 
 **改动**（每项都有微基准或测试支撑）：
 
-1. **GitHub 大文件恢复满并发**：`githubSmallChunks=4` 只对 <256MB 生效，1GB GitHub 文件用满 16 分片（`TestChunkCountLargeFilesAndGitHub` 覆盖阈值两侧）。
+1. **GitHub 大文件恢复满并发**：`githubSmallChunks=4` 只对 <256MB 生效，1GB GitHub 文件用满 16 分片（`TestWorkerCountLargeFilesAndGitHub` 覆盖阈值两侧）。
 2. **进度保存去 fsync**：新增 `Store.PutProgress`（tmp + 原子 rename，无 fsync），1GB 下载原本每 500ms 一次 fsync（微基准 60 次 = 573ms）。最终提交仍用带 fsync 的 `Put`，崩溃续传语义不变。
 3. **大文件进度间隔 500ms → 2s**：减少状态写入次数。
 4. **进度计数批量发布**：每累计 4MB 才抢一次共享锁（1GB 从 2048 次锁降到 256 次；微基准 72ms → 51ms）。
 
 **语义不变**：崩溃续传、sha256 校验、原子发布、状态文件一致性全部保留；`PutProgress` 的原子性由 `TestPutProgressIsAtomicAndReadable` 覆盖。
+
+---
+
+## 2026-11-28 大文件慢连接 / 挂死专项
+
+**背景**：用户反馈大文件"特别慢"。上一轮把大文件从 4 分片恢复到 16 分片，但仍然把
+3GB 文件切成 16 个 ~193MB 的固定分片：一条抖动/限速的连接会拖住整个尾巴，续传粒度
+也只有 193MB。另一个真实问题是 30 秒无数据超时挡不住"每几十秒滴几个字节"的连接，
+任务可以挂几个小时。
+
+**改动**
+
+1. **工作队列 + 小工作单元**：`workerCount` 仍决定并发（最多 16），但 `rangedChunks`
+   把文件切成约 `total/(workers*4)` 大小的单元，夹在 2–16MB 之间。3GB 从 16×193MB
+   变成约 192×16MB；256MB 从 16×16MB 变成 64×4MB。worker 动态领取，慢连接只拖一个单元，
+   完成的单元立即被其他 worker 接走。
+2. **速率看门狗**：30s 无数据仍会断开；新增 10s 窗口、低于 8KiB/s 就中止该连接（关闭
+   body + cancel context），重试/换镜像，避免滴流连接把任务挂死。
+3. **非 Range 中断恢复**：整文件 200 响应允许从 0 重启（旧分支不可达，导致永久
+   `all_mirrors_failed`）；非 Range 任务不再虚报 `resumed`。
+
+**本地基准**（256MB，Range server；旧=0.1.0，新=0.2.0；`--backend native`，含探测与
+sha256 校验；每档 2 次取较优）：
+
+| 场景 | 旧实现 | 新实现 | 变化 |
+|---|---|---|---|
+| 16 连接等速（无慢连接） | 400–524ms | 393–402ms | 无回退 |
+| 1 条连接限速 1MB/s | **16,749ms** | **4,396ms** | **3.8×** |
+
+**解释**：等速时两者都受环回/磁盘限制；慢连接场景的差距来自分片粒度。旧实现慢连接
+拿到 16MB 的一个整片，其他 15 条连接做完后只能等它；新实现慢连接只拿 4MB 的单元，
+其余 worker 把剩余单元清空，尾巴从 16MB 降到 4MB。3GB/16MB 单元的尾巴是旧实现的
+1/12，理论上收益更大。
+
+**真实网络抽检**
+
+- `dl.google.com` 76MB：旧 2.08s，新 1.80s（单次；此前同一命令曾因网络路径异常挂住
+  39 分钟，状态停在 4.7MB，说明挂死看门狗是必要的）。
+- HuggingFace/xet（`hf-mirror.com` 302 → `cas-bridge.xethub.hf.co`）：
+  - 单连接 64MB：2.01s ≈ 32MB/s；
+  - 16 路并行 128MB：约 2.45s ≈ 52MB/s。
+  - 但同一模型 3GB 任务在 2026-11-27 曾只有 ~1.5MB/s（native 1.9GB/19min，aria2 3.09GB/34.5min）。
+
+**结论**：代码侧能修的是"慢连接拖尾、分片粒度、滴流挂死、非 Range 恢复"；**物理带宽
+和 CDN/运营商路径不在客户端控制范围内**。遇到"慢"先用同 URL 的 curl 单连接 + 16 路
+并行 Range 各测一次：如果单连接就慢，或 16 路不聚合，瓶颈在路径/服务端，不在 OpenDrain。

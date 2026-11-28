@@ -52,29 +52,7 @@ func (s *Store) Manifest(verify bool, begin time.Time) (*Manifest, error) {
 		if gerr != nil || st == nil {
 			continue
 		}
-		target := st.Request.Target
-		ent := ManifestEntry{
-			ID: id, URL: st.Request.URL, Target: target,
-			Status: st.Status, Bytes: st.Total, Sha256: st.Sha256,
-			UpdatedAt: st.UpdatedAt,
-		}
-		if fi, serr := os.Stat(target); serr == nil && !fi.IsDir() && fi.Size() > 0 {
-			ent.OnDisk = true
-			if ent.Bytes <= 0 {
-				ent.Bytes = fi.Size()
-			}
-			if verify && ent.Sha256 != "" {
-				sum, herr := FileSha256(target)
-				ok := herr == nil && ent.Sha256 == "sha256:"+sum
-				ent.Verified = &ok
-				if !ok {
-					ent.Note = "digest mismatch; re-fetch before trusting this file"
-				}
-			}
-		} else {
-			ent.Note = "target missing; re-fetch to restore"
-		}
-		m.Entries = append(m.Entries, ent)
+		m.Entries = append(m.Entries, s.entryFor(st, id, verify))
 	}
 	sort.Slice(m.Entries, func(i, j int) bool {
 		return m.Entries[i].UpdatedAt.After(m.Entries[j].UpdatedAt)
@@ -87,6 +65,49 @@ func (s *Store) Manifest(verify bool, begin time.Time) (*Manifest, error) {
 	}
 	m.DurationMS = time.Since(begin).Milliseconds()
 	return m, nil
+}
+
+// entryFor builds one manifest row. Verifying re-hashes only this file, so
+// callers that already know the target (verify --target) never pay to read
+// every other managed file.
+func (s *Store) entryFor(st *State, id string, verify bool) ManifestEntry {
+	if id == "" {
+		id = st.ID
+	}
+	target := st.Request.Target
+	ent := ManifestEntry{
+		ID: id, URL: st.Request.URL, Target: target,
+		Status: st.Status, Bytes: st.Total, Sha256: st.Sha256,
+		UpdatedAt: st.UpdatedAt,
+	}
+	if fi, serr := os.Stat(target); serr == nil && !fi.IsDir() && fi.Size() > 0 {
+		ent.OnDisk = true
+		if ent.Bytes <= 0 {
+			ent.Bytes = fi.Size()
+		}
+		if verify && ent.Sha256 != "" {
+			sum, herr := FileSha256(target)
+			ok := herr == nil && ent.Sha256 == "sha256:"+sum
+			ent.Verified = &ok
+			if !ok {
+				ent.Note = "digest mismatch; re-fetch before trusting this file"
+			}
+		}
+	} else {
+		ent.Note = "target missing; re-fetch to restore"
+	}
+	return ent
+}
+
+// VerifyTarget re-hashes one managed file by its absolute target path. It
+// returns (nil, nil) when no task claims that path.
+func (s *Store) VerifyTarget(target string) (*ManifestEntry, error) {
+	st, err := s.FindByTarget(target)
+	if err != nil || st == nil {
+		return nil, err
+	}
+	ent := s.entryFor(st, st.ID, true)
+	return &ent, nil
 }
 
 // FindByTarget locates a managed file by its absolute target path. Used by

@@ -13,6 +13,11 @@ type Request struct {
 	Checksum string   `json:"checksum,omitempty"` // "sha256:<hex>"
 	Resume   bool     `json:"resume"`
 	Backend  string   `json:"backend,omitempty"` // auto | aria2 | native
+	// TaskKey is an optional caller-supplied stable identity. It exists for
+	// sources whose URL rotates (HuggingFace/xet, S3, CloudFront presigned
+	// links): passing the same key across refreshes keeps the resumable task
+	// alive even though the URL differs. Empty means "derive from URL+target".
+	TaskKey string `json:"task_key,omitempty"`
 }
 
 // Chunk tracks one byte range of the target file.

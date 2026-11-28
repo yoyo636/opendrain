@@ -41,17 +41,21 @@ Do not assume a `completed` state means the file is still there; check
 
 ```sh
 opendrain fetch --url URL --target PATH \
-  [--checksum sha256:HEX] [--mirror URL]... [--no-resume] [--backend auto|native|aria2]
+  [--checksum sha256:HEX] [--mirror URL]... [--task-key KEY] \
+  [--no-resume] [--backend auto|native|aria2]
 ```
 
 - `url` (required): http(s) source.
 - `target` (required): destination. While downloading, bytes live in
-  `<target>.part`; the real path appears only when the file is complete and
-  verified. A partial file can never be mistaken for the real one.
+  `<target>.part`; the real path appears only when the file is complete. A
+  fresh task also deletes any orphan `.part`/`.aria2` at that path, so stale
+  bytes from another task can never be published as this one.
 - `checksum` (optional): `sha256:<hex>`. Always pass it when the source
   publishes one. On mismatch the partial file is removed and the call fails
   with `checksum_mismatch`; for an already-cached file that fails re-hashing,
-  the file is renamed to `<target>.corrupt` (never silently deleted).
+  the file is renamed to `<target>.corrupt` (never silently deleted). A
+  cached file whose size no longer matches the recorded size is quarantined
+  and re-downloaded in the same call.
 - `mirrors` (optional): repeat `--mirror URL`. Candidates are probed in
   parallel (TTFB + Range support); the best is chosen and mid-download
   failures fall over to the next, keeping chunks already on disk. Probes are
@@ -61,20 +65,28 @@ opendrain fetch --url URL --target PATH \
   network loss — re-call the same command. `resumed: true` in the result means
   bytes already on disk were actually reused; if the partial file vanished,
   the download restarts and `resumed` stays false.
-- `backend` (default auto): native (16 ranged connections, zero subprocess
-  overhead) is the default; `aria2` is available if installed. Both have the
-  same CLI and semantics.
+- `task-key` (optional): a stable identity for sources whose signed URL
+  rotates (HuggingFace/xet, S3, CloudFront). Pass the SAME key when refreshing
+  the link, otherwise the new URL looks like a new task and loses progress.
+  GitHub and known HF hosts are canonicalised automatically.
+- `backend` (default auto): native (up to 16 workers, small work units, zero
+  subprocess overhead) is the default; `aria2` is available if installed. Both
+  have the same CLI and semantics.
 
 Result on success is one JSON object:
 
 ```json
 {"ok": true, "status": "completed", "target": "/path/file", "bytes": 1234567,
  "sha256": "sha256:...", "backend": "native", "selected_mirror": "https://...",
- "mirrors": [...], "resumed": false, "cached": false, "duration_ms": 431}
+ "mirrors": [...], "resumed": false, "cached": false, "integrity": "checksum",
+ "duration_ms": 431}
 ```
 
-`sha256` is the digest of the bytes actually written. If you did not pass a
-checksum, decide for yourself whether to trust the file before acting on it.
+`integrity: "checksum"` means the bytes matched the checksum you supplied.
+`integrity: "unverified"` means only transfer/size integrity was checked —
+`sha256` is the digest of what arrived, NOT proof that the source was correct.
+For anything you will build on, pass a checksum or verify against an
+independent source digest.
 
 Failure (exit 1): `{"ok": false, "status": "failed|cancelled", "error":
 {"code": ..., "message": ...}}`. Codes: `no_mirror_reachable`,
@@ -120,23 +132,30 @@ opendrain clean (--url URL --target PATH | --id ID | --all)
 ```
 
 `status` shows the full state of one task without touching it. `clean` drops
-state so the next fetch starts from scratch. A corrupt state never blocks a
-download: `fetch` self-heals by quarantining it and starting over.
+state and its `.part`/`.aria2`/`.corrupt` evidence so the next fetch starts
+from scratch; a task that is currently running is reported as `busy` instead
+of being deleted. Lock files are deliberately left in place (kernel-managed).
+A corrupt state never blocks a download: `fetch` self-heals by quarantining it
+and starting over.
 
 State lives in `~/.opendrain/state/<hash>.json` (hash of url + absolute target;
-relative and absolute paths map to the same hash).
+relative and absolute paths map to the same hash). The directory is 0700 and
+state files are 0600 because they can contain presigned URLs.
 
-## GitHub URLs
+## GitHub / signed URLs
 
-GitHub is a first-class source, not a generic URL:
+GitHub is a first-class source, but rotating signed URLs are wider than GitHub:
 
 - Credentials come from `GITHUB_TOKEN` / `GH_TOKEN` or `gh auth token`; they
   are only sent to `github.com` / `api.github.com` and are stripped on the
-  redirect to `release-assets.githubusercontent.com`.
+  redirect to `release-assets.githubusercontent.com`. The `gh` lookup is lazy
+  (only on a GitHub URL) and bounded by a timeout.
 - Release asset links are short-lived signed redirects. Task identity ignores
   rotating signature params, so re-calling after a link refresh still resumes.
-- Concurrency is capped at 4 chunks for GitHub hosts: measured CDN jitter made
-  16-way splitting slower. Range resume is retained for GB-scale assets.
+- `*.huggingface.co`, `*.hf.co`, `xethub.hf.co` and S3/GCS signature params are
+  canonicalised too. If your source is not recognised, pass `--task-key`.
+- Concurrency is capped at 4 workers for GitHub assets <256MB (measured CDN
+  jitter made 16-way slower); >=256MB automatically use the full 16.
 
 ## When NOT to use
 

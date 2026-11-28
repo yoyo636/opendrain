@@ -22,7 +22,7 @@ type Downloader interface {
 	Cancel(id string) error
 }
 
-// Result is the single JSON line returned to the agent on stdout.
+// Result is the single JSON object returned to the agent on stdout.
 type Result struct {
 	OK         bool        `json:"ok"`
 	Status     string      `json:"status"`
@@ -33,12 +33,21 @@ type Result struct {
 	Backend    string      `json:"backend,omitempty"`
 	Selected   string      `json:"selected_mirror,omitempty"`
 	Mirrors    []ProbeInfo `json:"mirrors,omitempty"`
-	Resumed    bool        `json:"resumed,omitempty"`
-	Cached     bool        `json:"cached,omitempty"`
+	Resumed    bool        `json:"resumed"`
+	Cached     bool        `json:"cached"`
+	Integrity  string      `json:"integrity,omitempty"` // checksum | unverified
 	Warnings   []string    `json:"warnings,omitempty"`
 	DurationMS int64       `json:"duration_ms"`
 	Error      *ErrInfo    `json:"error,omitempty"`
 }
+
+const (
+	// IntegrityChecksum means the bytes were compared against a caller-supplied
+	// sha256. IntegrityUnverified means only transfer/size integrity was
+	// established — "ok" is not a statement that the source was correct.
+	IntegrityChecksum   = "checksum"
+	IntegrityUnverified = "unverified"
+)
 
 // Fetch runs the full pipeline: validate → probe mirrors → pick backend →
 // download into <target>.part → verify checksum → atomically publish.
@@ -75,7 +84,7 @@ func Fetch(ctx context.Context, req Request, store *Store, backends []Downloader
 		req.Backend = "auto"
 	}
 
-	id := IDFor(req.URL, req.Target)
+	id := IDForTask(req.TaskKey, req.URL, req.Target)
 	res.ID = id
 	// Two agents may issue the same fetch at the same time; without a
 	// cross-process lock they would overwrite each other's state and the
@@ -111,58 +120,85 @@ func Fetch(ctx context.Context, req Request, store *Store, backends []Downloader
 	st.Error = nil
 	res.Target = req.Target
 
-	resumed := false
-
 	// Fast path: already completed and the file is still there — re-hash so
 	// the agent always gets a digest of the bytes actually on disk.
 	if st.Status == StatusCompleted {
 		if fi, serr := os.Stat(req.Target); serr == nil && fi.Size() > 0 {
-			sum, herr := FileSha256(req.Target)
-			if herr == nil {
-				st.Sha256 = "sha256:" + sum
-				st.Total = fi.Size()
-				if req.Checksum != "" && st.Sha256 != req.Checksum {
-					// This is the user's existing file, not a temp .part:
-					// never delete it on a mismatch. Move it aside so the
-					// agent can inspect the bytes that failed verification.
-					moved := quarantineTarget(req.Target)
-					detail := map[string]any{"expected": req.Checksum, "actual": st.Sha256}
-					msg := "checksum mismatch on cached file"
-					if moved != "" {
-						detail["quarantined_as"] = moved
-						msg += "; file moved to " + moved
-					} else {
-						msg += "; file left in place (rename failed)"
-					}
-					return fatal(store, st, CodeChecksum, msg, detail, begin)
+			recorded := st.Total
+			if recorded > 0 && fi.Size() != recorded {
+				// A cached file whose size disagrees with the recorded size is
+				// truncated or was replaced. Hashing it would "succeed" and
+				// report a fresh digest for the wrong bytes; quarantine it and
+				// re-download in this same call instead.
+				moved := quarantineTarget(req.Target)
+				if moved == "" {
+					return fatal(store, st, CodeIncomplete,
+						fmt.Sprintf("cached file size %d does not match recorded %d and could not be quarantined", fi.Size(), recorded), nil, begin)
 				}
-				_ = store.Put(st)
-				fillResult(res, st, false, true, begin)
-				return res, st
+				st.Status = StatusNew
+				st.Chunks, st.Done, st.Mode, st.Total, st.Sha256 = nil, 0, "", 0, ""
+				st.Warnings = append(st.Warnings, fmt.Sprintf(
+					"cached file size %d does not match recorded %d; moved to %s and re-downloading",
+					fi.Size(), recorded, moved))
+			} else {
+				sum, herr := FileSha256(req.Target)
+				if herr == nil {
+					st.Sha256 = "sha256:" + sum
+					st.Total = fi.Size()
+					if req.Checksum != "" && st.Sha256 != req.Checksum {
+						// This is the user's existing file, not a temp .part:
+						// never delete it on a mismatch. Move it aside so the
+						// agent can inspect the bytes that failed verification.
+						moved := quarantineTarget(req.Target)
+						detail := map[string]any{"expected": req.Checksum, "actual": st.Sha256}
+						msg := "checksum mismatch on cached file"
+						if moved != "" {
+							detail["quarantined_as"] = moved
+							msg += "; file moved to " + moved
+						} else {
+							msg += "; file left in place (rename failed)"
+						}
+						return fatal(store, st, CodeChecksum, msg, detail, begin)
+					}
+					_ = store.Put(st)
+					fillResult(res, st, false, true, begin)
+					return res, st
+				}
 			}
+		} else {
+			st.Status = StatusNew // file is gone; download again
 		}
-		st.Status = StatusNew // file is gone; download again
 	}
 
+	// A task with no usable progress must not inherit whatever happens to sit
+	// at <target>.part. aria2 runs with --continue=true and treats existing
+	// bytes as a downloaded prefix; if those bytes came from a different task
+	// (a rotated signed URL creates a new ID, and clean used to leave parts
+	// behind) the published file would be silently corrupt.
 	if !req.Resume {
-		os.Remove(st.PartPath)
-		os.Remove(st.PartPath + ".aria2")
+		removePartialFiles(st.PartPath)
 		st.Chunks, st.Done, st.Mode, st.Total, st.Sha256 = nil, 0, "", 0, ""
 		st.Status = StatusNew
-	} else if st.Mode != "" || len(st.Chunks) > 0 || st.Done > 0 {
-		// Progress only survives if the part file is still there.
-		if _, perr := os.Stat(st.PartPath); perr != nil {
-			st.Chunks, st.Done, st.Mode, st.Total = nil, 0, "", 0
+	} else if st.Done == 0 && len(st.Chunks) == 0 && st.Mode == "" {
+		if removePartialFiles(st.PartPath) {
+			st.Warnings = append(st.Warnings, "discarded a stale partial file at "+st.PartPath+" (no resumable state for this task)")
 		}
+		st.Chunks, st.Done, st.Mode, st.Total, st.Sha256 = nil, 0, "", 0, ""
+		st.Status = StatusNew
+	} else if _, perr := os.Stat(st.PartPath); perr != nil {
+		// Recorded progress is unusable without the part file: drop it and
+		// restart honestly from zero.
+		removePartialFiles(st.PartPath)
+		st.Chunks, st.Done, st.Mode, st.Total, st.Sha256 = nil, 0, "", 0, ""
 	}
 
-	// `resumed` is computed here, AFTER the progress reset above: if the
-	// part file was gone the recorded progress was dropped and the download
-	// restarts from zero, so claiming "resumed" would be a lie. The agent
-	// uses this flag to decide whether a re-call was cheap.
+	// From here on `resumed` is only a candidate: the selected mirror must
+	// actually support Range for recorded progress to be reusable. The final
+	// flag is decided after probing.
+	resumeCandidate := false
 	if req.Resume && (st.Status == StatusDownloading || st.Status == StatusFailed || st.Status == StatusCancelled) {
 		if st.Done > 0 || len(st.Chunks) > 0 {
-			resumed = true
+			resumeCandidate = true
 		}
 	}
 
@@ -187,7 +223,19 @@ func Fetch(ctx context.Context, req Request, store *Store, backends []Downloader
 	}
 	st.Selected = cands[0]
 
-	// Pick backend: aria2 preferred (mature multi-connection), native fallback.
+	// Recorded progress is only reusable when the selected mirror still
+	// supports byte ranges and still reports the same total size. Otherwise
+	// the backend will restart from zero and claiming "resumed" would lie.
+	resumed := resumeCandidate
+	if resumed {
+		if !st.Probes[0].RangeOK {
+			resumed = false
+		} else if st.Total > 0 && st.Probes[0].Size >= 0 && st.Total != st.Probes[0].Size {
+			resumed = false
+		}
+	}
+
+	// Pick backend: native is primary, aria2 is the fallback (and explicit).
 	var chosen, fallback Downloader
 	byName := func(name string) Downloader {
 		for _, b := range backends {
@@ -206,7 +254,7 @@ func Fetch(ctx context.Context, req Request, store *Store, backends []Downloader
 		}
 	case "native":
 		chosen = byName("native")
-	default: // auto
+	case "auto", "": // auto
 		// Native is now the primary backend at every size: it uses up to 16
 		// ranged connections with no subprocess/RPC startup, and measured
 		// 5-14x faster than aria2 in the local throttled-host benchmark.
@@ -216,6 +264,13 @@ func Fetch(ctx context.Context, req Request, store *Store, backends []Downloader
 		if chosen == nil {
 			chosen, fallback = fallback, nil
 		}
+		if fallback != nil && !fallback.Available(ctx) {
+			// Don't replace a real primary failure with "aria2c not found".
+			fallback = nil
+		}
+	default:
+		return fatal(store, st, CodeBadInput,
+			fmt.Sprintf("unknown backend %q (want auto, aria2 or native)", req.Backend), nil, begin)
 	}
 	if chosen == nil {
 		return fatal(store, st, CodeInternal, "no downloader backend available", nil, begin)
@@ -253,7 +308,17 @@ func Fetch(ctx context.Context, req Request, store *Store, backends []Downloader
 	cancelled := errors.Is(berr, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
 	if berr != nil && fallback != nil && !cancelled {
 		st.Attempts++
-		berr = run(fallback)
+		primaryErr := berr
+		ferr := run(fallback)
+		if ferr != nil {
+			// Keep the primary error: it usually says why the network path is
+			// broken, while the fallback's "aria2c not found" would hide it.
+			st.Warnings = append(st.Warnings,
+				fmt.Sprintf("fallback backend %s also failed: %v", fallback.Name(), ferr))
+			berr = primaryErr
+		} else {
+			berr = nil
+		}
 	}
 	if berr != nil {
 		// Pull the freshest progress from disk before stamping the failure,
@@ -283,6 +348,8 @@ func Fetch(ctx context.Context, req Request, store *Store, backends []Downloader
 		res.Backend = st.Backend
 		res.Mirrors = st.Probes
 		res.Selected = st.Selected
+		res.Integrity = integrityOf(st.Request.Checksum)
+		res.Warnings = st.Warnings
 		res.Error = st.Error
 		res.DurationMS = time.Since(begin).Milliseconds()
 		return res, st
@@ -381,6 +448,7 @@ func fatal(store *Store, st *State, code, msg string, detail map[string]any, beg
 		res.Target = st.Request.Target
 		res.Backend = st.Backend
 		res.Mirrors = st.Probes
+		res.Integrity = integrityOf(st.Request.Checksum)
 		res.Warnings = st.Warnings
 	}
 	res.Error = &ErrInfo{Code: code, Message: msg, Detail: detail}
@@ -398,9 +466,33 @@ func fillResult(res *Result, st *State, resumed, cached bool, begin time.Time) {
 	res.Mirrors = st.Probes
 	res.Resumed = resumed
 	res.Cached = cached
+	res.Integrity = integrityOf(st.Request.Checksum)
 	res.Warnings = st.Warnings
 	res.DurationMS = time.Since(begin).Milliseconds()
 	res.Error = st.Error
+}
+
+// integrityOf turns "did the caller supply a checksum" into a machine-readable
+// trust level. Without one, sha256 describes the bytes we got, not the bytes
+// the source intended — callers can no longer mistake ok:true for "verified".
+func integrityOf(checksum string) string {
+	if checksum != "" {
+		return IntegrityChecksum
+	}
+	return IntegrityUnverified
+}
+
+// removePartialFiles drops the part file and aria2's control file. It returns
+// true when a part file existed, so callers can report an orphan discard.
+func removePartialFiles(part string) bool {
+	if part == "" {
+		return false
+	}
+	_, err := os.Stat(part)
+	existed := err == nil
+	_ = os.Remove(part)
+	_ = os.Remove(part + ".aria2")
+	return existed
 }
 
 // StateJSON is a convenience for the status subcommand.

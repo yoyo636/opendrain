@@ -26,12 +26,21 @@ var skillMD []byte
 //go:embed skills/fetch/SKILL.md
 var legacySkillMD []byte
 
+// version is injected by the release build with -X main.version.
+var version = "0.2.0"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "help", "-h", "--help":
+		usageTo(os.Stdout)
+		return
+	case "version", "-v", "--version":
+		fmt.Println("opendrain " + version)
+		return
 	case "fetch":
 		runFetch(os.Args[2:])
 	case "status":
@@ -53,23 +62,32 @@ func main() {
 	}
 }
 
-func usage() {
-	fmt.Fprint(os.Stderr, `opendrain — agent-native download layer
+func usage() { usageTo(os.Stderr) }
+
+func usageTo(w io.Writer) {
+	fmt.Fprint(w, `opendrain — agent-native download layer
 
 Usage:
   opendrain fetch --url URL --target PATH [--checksum sha256:HEX]
-                  [--mirror URL]... [--no-resume] [--backend auto|aria2|native]
-  opendrain status (--url URL --target PATH | --id ID)
-  opendrain clean (--url URL --target PATH | --id ID | --all)
+                  [--mirror URL]... [--task-key KEY] [--no-resume]
+                  [--backend auto|aria2|native]
+  opendrain status (--url URL --target PATH | --id ID) [--task-key KEY]
+  opendrain clean (--url URL --target PATH | --id ID | --all) [--task-key KEY]
   opendrain manifest [--verify]      list every file this agent manages
   opendrain verify [--target PATH]   re-hash managed files against stored digests
   opendrain read --target PATH [--grep RE] [--context N] [--head N | --tail N]
                           [--max-bytes N]   bounded excerpt, no bulk context cost
   opendrain install          install the opendrain skill into agent configs
+  opendrain --version | --help
 
-fetch(url, target, checksum?, mirrors?, resume?) — bytes go to disk, one JSON
-result line to stdout, errors are structured and always leave the target path
+fetch(url, target, checksum?, mirrors?, resume?) — bytes go to disk, one small
+JSON object to stdout, errors are structured and always leave the target path
 free of partial files. Downloads are resumable across processes and sessions.
+--task-key keeps one task identity when a signed source URL rotates (S3,
+HuggingFace/xet); pass the same key across link refreshes.
+
+Without --checksum, "ok" means the transfer completed and sizes match; use
+"integrity":"unverified" as a reminder that the source itself was not verified.
 `)
 }
 
@@ -98,6 +116,7 @@ func runFetch(args []string) {
 	fs.Var(&mirrors, "mirrors", "alias of --mirror (repeatable)")
 	noResume := fs.Bool("no-resume", false, "restart from scratch, ignoring previous state")
 	backendF := fs.String("backend", "auto", "auto | aria2 | native")
+	taskKeyF := fs.String("task-key", "", "stable task identity for rotating signed URLs")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
@@ -121,7 +140,7 @@ func runFetch(args []string) {
 	}
 
 	// Progress ticker to stderr (humans only; agents read stdout JSON).
-	id := core.IDFor(*urlF, *targetF)
+	id := core.IDForTask(*taskKeyF, *urlF, *targetF)
 	tty := isTTY(os.Stderr)
 	done := make(chan struct{})
 	if tty {
@@ -152,6 +171,7 @@ func runFetch(args []string) {
 		Mirrors:  mirrors,
 		Resume:   !*noResume,
 		Backend:  *backendF,
+		TaskKey:  *taskKeyF,
 	}
 	backends := []core.Downloader{backend.NewAria2(), backend.NewNative()}
 	res, _ := core.Fetch(ctx, req, store, backends)
@@ -170,18 +190,38 @@ func isTTY(f *os.File) bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
+// validTaskID rejects path separators and anything that is not a state id,
+// so `clean --id ../../foo` cannot reach outside the state directory.
+func validTaskID(id string) bool {
+	if len(id) != 64 {
+		return false
+	}
+	for _, c := range id {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func runStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	urlF := fs.String("url", "", "")
 	targetF := fs.String("target", "", "")
 	idF := fs.String("id", "", "")
+	taskKeyF := fs.String("task-key", "", "")
 	_ = fs.Parse(args)
 	var id string
 	switch {
 	case *idF != "":
+		if !validTaskID(*idF) {
+			emit(&core.Result{OK: false, Status: core.StatusFailed,
+				Error: &core.ErrInfo{Code: core.CodeBadInput, Message: "invalid --id (want 64 lowercase hex chars)"}})
+			os.Exit(2)
+		}
 		id = *idF
 	case *urlF != "" && *targetF != "":
-		id = core.IDFor(*urlF, *targetF)
+		id = core.IDForTask(*taskKeyF, *urlF, *targetF)
 	default:
 		emit(&core.Result{OK: false, Status: core.StatusFailed,
 			Error: &core.ErrInfo{Code: core.CodeBadInput, Message: "status needs --url --target or --id"}})
@@ -223,6 +263,7 @@ func runClean(args []string) {
 	urlF := fs.String("url", "", "")
 	targetF := fs.String("target", "", "")
 	idF := fs.String("id", "", "")
+	taskKeyF := fs.String("task-key", "", "")
 	allF := fs.Bool("all", false, "remove every state file")
 	_ = fs.Parse(args)
 
@@ -252,29 +293,90 @@ func runClean(args []string) {
 			}
 		}
 	case *idF != "":
+		if !validTaskID(*idF) {
+			emit(&core.Result{OK: false, Status: core.StatusFailed,
+				Error: &core.ErrInfo{Code: core.CodeBadInput, Message: "invalid --id (want 64 lowercase hex chars)"}})
+			os.Exit(2)
+		}
 		ids = append(ids, *idF)
 	case *urlF != "" && *targetF != "":
-		ids = append(ids, core.IDFor(*urlF, *targetF))
+		ids = append(ids, core.IDForTask(*taskKeyF, *urlF, *targetF))
 	default:
 		emit(&core.Result{OK: false, Status: core.StatusFailed,
 			Error: &core.ErrInfo{Code: core.CodeBadInput, Message: "clean needs --id, --url with --target, or --all"}})
 		os.Exit(2)
 	}
 
-	removed, missing := []string{}, []string{}
+	removed, missing, busy := []string{}, []string{}, []string{}
+	seen := map[string]bool{}
 	for _, id := range ids {
-		p := store.Path(id)
-		if err := os.Remove(p); err != nil {
-			missing = append(missing, p)
+		if !validTaskID(id) || seen[id] {
 			continue
 		}
-		removed = append(removed, p)
+		seen[id] = true
+
+		// A running fetch holds this lock; deleting its state/part would
+		// corrupt a live download, so report it as busy instead.
+		lockCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		release, lerr := store.TaskLock(lockCtx, id)
+		cancel()
+		if lerr != nil {
+			busy = append(busy, id)
+			continue
+		}
+
+		st, _ := store.Get(id)
+		_, corruptErr := os.Stat(store.Path(id) + ".corrupt")
+		type candidate struct {
+			path     string
+			required bool // a missing required state path is reported
+		}
+		// A corrupt-only task has no .json; don't report that as "not found"
+		// while successfully removing its .json.corrupt evidence.
+		cands := []candidate{
+			{store.Path(id), corruptErr != nil},
+			{store.Path(id) + ".corrupt", false},
+		}
+		if st != nil {
+			part := st.PartPath
+			if part == "" && st.Request.Target != "" {
+				part = st.Request.Target + ".part"
+			}
+			if part != "" {
+				cands = append(cands,
+					candidate{part, false},
+					candidate{part + ".aria2", false})
+			}
+			if target := st.Request.Target; target != "" {
+				// Quarantined evidence lives next to the target, not in the
+				// state file, so clean has to find it by convention.
+				cands = append(cands, candidate{target + ".corrupt", false})
+				if matches, _ := filepath.Glob(target + ".corrupt-*"); len(matches) > 0 {
+					for _, m := range matches {
+						cands = append(cands, candidate{m, false})
+					}
+				}
+			}
+		}
+		for _, c := range cands {
+			err := os.Remove(c.path)
+			if err == nil {
+				removed = append(removed, c.path)
+			} else if c.required && os.IsNotExist(err) {
+				missing = append(missing, c.path)
+			} else if c.required {
+				missing = append(missing, c.path+": "+err.Error())
+			}
+		}
+		release()
 	}
 	emit(map[string]any{
 		"ok":        true,
 		"removed":   removed,
 		"not_found": missing,
-		"note":      "state dropped; the next fetch starts from scratch (partial .part files are overwritten, not deleted)",
+		"busy":      busy,
+		"note": "state and partial files dropped; the next fetch starts from scratch. " +
+			"Lock files stay in place: they are kernel-managed and releasing them is not safe while a fetch runs.",
 	})
 }
 
@@ -313,42 +415,52 @@ func runVerify(args []string) {
 			Error: &core.ErrInfo{Code: core.CodeInternal, Message: err.Error()}})
 		os.Exit(1)
 	}
-	m, err := store.Manifest(true, begin)
-	if err != nil {
-		emit(&core.Result{OK: false, Status: core.StatusFailed,
-			Error: &core.ErrInfo{Code: core.CodeInternal, Message: err.Error()}})
-		os.Exit(1)
-	}
+	var entries []core.ManifestEntry
 	if *targetF != "" {
-		abs, aerr := filepath.Abs(*targetF)
-		if aerr != nil {
+		// Hash only this file. The old path built a full manifest (re-hashing
+		// every managed file) and then filtered, which is pathological when
+		// one 3GB model lives next to a dozen small files.
+		ent, verr := store.VerifyTarget(*targetF)
+		if verr != nil {
 			emit(&core.Result{OK: false, Status: core.StatusFailed,
-				Error: &core.ErrInfo{Code: core.CodeBadInput, Message: aerr.Error()}})
-			os.Exit(2)
+				Error: &core.ErrInfo{Code: core.CodeInternal, Message: verr.Error()}})
+			os.Exit(1)
 		}
-		filtered := []core.ManifestEntry{}
-		for _, e := range m.Entries {
-			if e.Target == abs {
-				filtered = append(filtered, e)
-			}
+		if ent == nil {
+			emit(&core.Result{OK: false, Status: core.StatusFailed,
+				Error: &core.ErrInfo{Code: core.CodeNotFound,
+					Message: "no managed task for target " + *targetF}})
+			os.Exit(1)
 		}
-		m.Entries = filtered
-		m.Count = len(filtered)
-		m.OnDisk = 0
-		for _, e := range filtered {
-			if e.OnDisk {
-				m.OnDisk++
-			}
+		if !ent.OnDisk {
+			emit(&core.Result{OK: false, Status: core.StatusFailed,
+				Error: &core.ErrInfo{Code: core.CodeIncomplete,
+					Message: "target missing: " + *targetF}})
+			os.Exit(1)
 		}
+		entries = []core.ManifestEntry{*ent}
+	} else {
+		m, merr := store.Manifest(true, begin)
+		if merr != nil {
+			emit(&core.Result{OK: false, Status: core.StatusFailed,
+				Error: &core.ErrInfo{Code: core.CodeInternal, Message: merr.Error()}})
+			os.Exit(1)
+		}
+		entries = m.Entries
 	}
-	bad := 0
-	for _, e := range m.Entries {
+
+	bad, onDisk := 0, 0
+	for _, e := range entries {
+		if e.OnDisk {
+			onDisk++
+		}
 		if e.Verified != nil && !*e.Verified {
 			bad++
 		}
 	}
-	emit(map[string]any{"ok": bad == 0, "checked": m.Count, "on_disk": m.OnDisk,
-		"mismatches": bad, "entries": m.Entries, "duration_ms": m.DurationMS})
+	emit(map[string]any{"ok": bad == 0, "checked": len(entries), "on_disk": onDisk,
+		"mismatches": bad, "entries": entries,
+		"duration_ms": time.Since(begin).Milliseconds()})
 	if bad > 0 {
 		os.Exit(1)
 	}

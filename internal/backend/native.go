@@ -15,21 +15,21 @@ import (
 )
 
 const (
-	stallTimeout   = 30 * time.Second
 	attemptsPerURL = 3
-	maxConns       = 6
 	minRangedSize  = 8 << 20
-	// Chunk sizing drives real throughput: with 16MB chunks a 28MB file only
-	// got two connections, which lost to curl on throttled hosts. Aim for
-	// ~2MB per connection so mid-size files can actually saturate a link,
-	// while capping concurrency so we don't hammer small servers.
-	targetChunk    = 2 << 20
-	maxChunks      = 16
-	minChunkSize   = 1 << 20
-	copyBufferSize = 512 << 10
-	// GitHub CDN paths are throttled and jittery for small files, so keep a
-	// conservative cap there — but GB-scale assets need real concurrency or
-	// a 4-way download takes many minutes. The cap lifts automatically.
+	// Concurrency and chunk granularity are separate concerns. Splitting a
+	// 1GB file into exactly 16 ranges gives each connection a 64MB tail, so
+	// one jittery connection dominates the whole download and resume loses at
+	// most 64MB. Instead, cut the file into many small work units and let a
+	// fixed pool of workers pull them: a slow connection only delays one unit,
+	// fast workers drain the rest, and resume granularity is much finer.
+	targetChunk       = 2 << 20  // used to derive the worker count
+	minChunkSize      = 2 << 20  // never create request overhead for <2MB
+	maxChunkSize      = 16 << 20 // ~12 units per worker on a 3GB file
+	chunksPerWorker   = 4        // work units per worker, for load balance
+	maxWorkChunks     = 4096     // sanity cap on persisted chunk count
+	maxChunks         = 16       // simultaneous connections
+	copyBufferSize    = 512 << 10
 	githubSmallChunks = 4
 	githubLargeSize   = 256 << 20
 	// Accumulate progress locally and publish to the shared counter in
@@ -38,6 +38,15 @@ const (
 	// Progress snapshots do not need fsync or 500ms granularity on big files.
 	smallProgressInterval = 500 * time.Millisecond
 	largeProgressInterval = 2 * time.Second
+)
+
+// Liveness thresholds are variables so tests can shorten the window. A
+// connection that trickles a byte every few seconds used to keep the 30s
+// inactivity timer alive forever; the rate window catches that.
+var (
+	stallTimeout = 30 * time.Second
+	rateWindow   = 10 * time.Second
+	minReadRate  = int64(8 << 10) // 8 KiB/s sustained; below this is dead
 )
 
 // Native is the zero-dependency fallback downloader: concurrent Range
@@ -76,9 +85,10 @@ func (n *Native) Status(id string) (*core.State, error) {
 func (n *Native) Cancel(id string) error { return cancelByID(id) }
 
 type dlPlan struct {
-	mode   string
-	total  int64 // -1 = unknown
-	chunks []core.Chunk
+	mode    string
+	total   int64 // -1 = unknown
+	chunks  []core.Chunk
+	workers int
 }
 
 func (n *Native) Start(ctx context.Context, st *core.State, store *core.Store) error {
@@ -107,22 +117,60 @@ func (n *Native) Start(ctx context.Context, st *core.State, store *core.Store) e
 	defer cancel()
 	trackCancel(st.ID, cancel)
 
-	errMu := &sync.Mutex{}
-	errs := make([]error, len(plan.chunks))
-	var wg sync.WaitGroup
-	for i := range plan.chunks {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			e := n.runChunk(gctx, f, i, plan, urls, prog)
-			errMu.Lock()
-			errs[i] = e
-			errMu.Unlock()
-			if e != nil {
-				cancel()
-			}
-		}(i)
+	workers := plan.workers
+	if workers < 1 {
+		workers = 1
 	}
+	if workers > len(plan.chunks) {
+		workers = len(plan.chunks)
+	}
+
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	work := make(chan int)
+	fail := func(e error) {
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = e
+		}
+		errMu.Unlock()
+		cancel()
+	}
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range work {
+				if gctx.Err() != nil {
+					return
+				}
+				if e := n.runChunk(gctx, f, idx, plan, urls, prog); e != nil {
+					fail(e)
+					return
+				}
+			}
+		}()
+	}
+	// Feeder: skip chunks already complete from a previous session, hand the
+	// rest to whichever worker is free. Unbuffered so a cancelled download
+	// never blocks closing the channel.
+	go func() {
+		defer close(work)
+		for i := range plan.chunks {
+			ch := plan.chunks[i]
+			if ch.Size() >= 0 && prog.chunkDone(i) >= ch.Size() {
+				continue
+			}
+			select {
+			case work <- i:
+			case <-gctx.Done():
+				return
+			}
+		}
+	}()
 
 	done := make(chan struct{})
 	var saverWG sync.WaitGroup
@@ -156,14 +204,10 @@ func (n *Native) Start(ctx context.Context, st *core.State, store *core.Store) e
 	if ctx.Err() != nil {
 		return core.Fail(core.CodeCancelled, "download cancelled; state kept on disk, re-call to resume", nil)
 	}
-	var realErr error
-	for _, e := range errs {
-		if e != nil && !errors.Is(e, context.Canceled) {
-			realErr = e
-			break
-		}
-	}
-	if realErr != nil {
+	errMu.Lock()
+	realErr := firstErr
+	errMu.Unlock()
+	if realErr != nil && !errors.Is(realErr, context.Canceled) {
 		return core.Fail(core.CodeAllFailed, "chunk failed after all mirrors/attempts: "+realErr.Error(), nil)
 	}
 	got, _ := prog.snapshot()
@@ -179,7 +223,11 @@ func (n *Native) Start(ctx context.Context, st *core.State, store *core.Store) e
 	st.Done = got
 	st.Chunks = plan.chunks
 	for i := range st.Chunks {
-		st.Chunks[i].Done = st.Chunks[i].Size()
+		if st.Chunks[i].Size() >= 0 {
+			st.Chunks[i].Done = st.Chunks[i].Size()
+		} else {
+			st.Chunks[i].Done = st.Total
+		}
 	}
 	return nil
 }
@@ -200,9 +248,9 @@ func planDownload(ctx context.Context, st *core.State, f *os.File) (dlPlan, erro
 	total := probe.Size // -1 = unknown
 	ranged := probe.RangeOK
 	// GitHub's signed CDN redirects showed highly unstable per-connection
-	// throughput; 16-way splitting amplifies that jitter. Keep ranged resume
-	// (essential for GB-scale assets) but cap concurrency for GitHub hosts.
-	github := core.UseSingleStream(st.Request.URL)
+	// throughput; cap the worker count for SMALL GitHub files while letting
+	// GB-scale assets use the full pool. Chunk granularity is handled below.
+	github := core.GitHubThrottled(st.Request.URL)
 	partSize := fileStats(f)
 
 	fresh := func() (dlPlan, error) {
@@ -218,28 +266,32 @@ func planDownload(ctx context.Context, st *core.State, f *os.File) (dlPlan, erro
 			if total >= 0 {
 				end = total - 1
 			}
-			return dlPlan{mode: core.ModeSingle, total: total, chunks: []core.Chunk{{Start: 0, End: end}}}, nil
+			return dlPlan{mode: core.ModeSingle, total: total,
+				chunks: []core.Chunk{{Start: 0, End: end}}, workers: 1}, nil
 		}
-		n := chunkCount(total, github)
-		chunks := makeChunks(total, n)
+		workers := workerCount(total, github)
+		chunks := rangedChunks(total, workers)
 		st.Mode, st.Chunks, st.Total, st.Done = core.ModeRanged, chunks, total, 0
 		_ = f.Truncate(total)
-		return dlPlan{mode: core.ModeRanged, total: total, chunks: chunks}, nil
+		return dlPlan{mode: core.ModeRanged, total: total, chunks: chunks, workers: workers}, nil
 	}
 
 	if st.Mode == core.ModeRanged && len(st.Chunks) > 0 && total >= 0 && st.Total == total && partSize == total {
-		// resume a previous ranged download
-		return dlPlan{mode: core.ModeRanged, total: total, chunks: st.Chunks}, nil
-	}
-	if st.Mode == core.ModeSingle && len(st.Chunks) == 1 && st.Done > 0 &&
-		partSize == st.Done && (total < 0 || st.Total == total || st.Total == 0) {
-		// resume a previous single-stream download
-		c := st.Chunks[0]
-		if total >= 0 {
-			c.End = total - 1
+		// Resume a previous ranged download. Existing states may carry fewer
+		// (larger) chunks from older versions; keep them rather than throwing
+		// away completed work, and cap the worker count to the chunk count.
+		workers := workerCount(total, github)
+		if workers > len(st.Chunks) {
+			workers = len(st.Chunks)
 		}
-		return dlPlan{mode: core.ModeSingle, total: total, chunks: []core.Chunk{c}}, nil
+		if workers < 1 {
+			workers = 1
+		}
+		return dlPlan{mode: core.ModeRanged, total: total, chunks: st.Chunks, workers: workers}, nil
 	}
+	// Single-stream and unknown-size downloads cannot be resumed reliably:
+	// a server that ignores Range has no way to continue from an offset. A
+	// fresh start is the only honest option (Fetch reports resumed=false).
 	return fresh()
 }
 
@@ -265,7 +317,7 @@ func (n *Native) runChunk(ctx context.Context, f *os.File, idx int, plan dlPlan,
 			continue
 		}
 		acceptable := status == http.StatusPartialContent ||
-			(status == http.StatusOK && whole && done == 0)
+			(status == http.StatusOK && whole)
 		if !acceptable {
 			_, _ = io.Copy(io.Discard, io.LimitReader(body, 1024))
 			body.Close()
@@ -274,11 +326,12 @@ func (n *Native) runChunk(ctx context.Context, f *os.File, idx int, plan dlPlan,
 		}
 		effDone := done
 		if status == http.StatusOK && done > 0 {
-			// server ignored Range; restart this chunk from zero
+			// Server ignored Range. Since this is the whole file, restart from
+			// zero: truncate and rewind progress. Previously this branch was
+			// unreachable (acceptable rejected 200 when done>0), so a single
+			// interrupted non-Range download could never finish.
 			prog.setChunk(idx, 0)
-			if unknown {
-				_ = f.Truncate(0)
-			}
+			_ = f.Truncate(0)
 			effDone = 0
 		}
 		start := ch.Start + effDone
@@ -398,20 +451,40 @@ func copyChunk(f *os.File, body io.Reader, start, remaining int64, prog *progres
 
 type stallBody struct {
 	io.ReadCloser
-	cancel context.CancelFunc
-	t      *time.Timer
+	cancel      context.CancelFunc
+	t           *time.Timer
+	windowStart time.Time
+	windowBytes int64
 }
 
 func newStallBody(rc io.ReadCloser, cancel context.CancelFunc) *stallBody {
-	sb := &stallBody{ReadCloser: rc, cancel: cancel}
-	sb.t = time.AfterFunc(stallTimeout, sb.cancel)
+	sb := &stallBody{ReadCloser: rc, cancel: cancel, windowStart: time.Now()}
+	sb.t = time.AfterFunc(stallTimeout, sb.abort)
 	return sb
+}
+
+// abort closes the body as well as cancelling the request context. Closing is
+// what actually unblocks a goroutine already parked in a socket read; context
+// cancellation alone was not enough on every platform/path.
+func (s *stallBody) abort() {
+	s.cancel()
+	_ = s.ReadCloser.Close()
 }
 
 func (s *stallBody) Read(p []byte) (int, error) {
 	n, err := s.ReadCloser.Read(p)
 	if n > 0 {
+		s.windowBytes += int64(n)
 		s.t.Reset(stallTimeout)
+		now := time.Now()
+		if elapsed := now.Sub(s.windowStart); elapsed >= rateWindow {
+			rate := float64(s.windowBytes) / elapsed.Seconds()
+			if rate < float64(minReadRate) {
+				s.abort()
+				return n, fmt.Errorf("download stalled: %.0f B/s is below %d B/s", rate, minReadRate)
+			}
+			s.windowStart, s.windowBytes = now, 0
+		}
 	}
 	return n, err
 }
@@ -478,13 +551,13 @@ func saveProgress(st *core.State, store *core.Store, prog *progress, plan dlPlan
 	_ = store.PutProgress(&cp)
 }
 
-// chunkCount decides concurrency from file size and host. Kept pure so the
-// large-file / GitHub small-file rules can be tested without a network.
-func chunkCount(total int64, github bool) int {
+// workerCount decides simultaneous connections from file size and host. Kept
+// pure so the large-file / GitHub small-file rules can be tested offline.
+func workerCount(total int64, github bool) int {
 	if total < minRangedSize {
 		return 1
 	}
-	// round up so a 28MB file gets 14 chunks instead of 2
+	// round up so a 28MB file gets 14 workers instead of 2
 	n := int((total + targetChunk - 1) / targetChunk)
 	if n > maxChunks {
 		n = maxChunks
@@ -492,7 +565,7 @@ func chunkCount(total int64, github bool) int {
 	if n < 2 {
 		n = 2
 	}
-	// never create sub-1MB chunks: request overhead would eat the gain
+	// never create sub-2MB work units: request overhead would eat the gain
 	if byMin := int(total / minChunkSize); n > byMin && byMin > 1 {
 		n = byMin
 	}
@@ -504,7 +577,33 @@ func chunkCount(total int64, github bool) int {
 	return n
 }
 
-func makeChunks(total int64, n int) []core.Chunk { return core.MakeChunks(total, n) }
+// rangedChunks cuts the target into many small work units for the worker pool.
+// Old versions created exactly workerCount chunks, so a 3GB download had 16
+// ~193MB tails; a single jittery connection then added minutes to the end.
+// With ~2-16MB units a slow connection only delays one small piece.
+func rangedChunks(total int64, workers int) []core.Chunk {
+	if total <= 0 {
+		return nil
+	}
+	size := int64(maxChunkSize)
+	if workers > 1 {
+		size = total / int64(workers*chunksPerWorker)
+	}
+	if size < minChunkSize {
+		size = minChunkSize
+	}
+	if size > maxChunkSize {
+		size = maxChunkSize
+	}
+	n := int((total + size - 1) / size)
+	if n < 1 {
+		n = 1
+	}
+	if n > maxWorkChunks {
+		n = maxWorkChunks
+	}
+	return core.MakeChunks(total, n)
+}
 
 func fileSize(p string) int64 {
 	if fi, err := os.Stat(p); err == nil {

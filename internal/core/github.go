@@ -29,10 +29,10 @@ func IsGitHubURL(raw string) bool {
 	return err == nil && GitHubHost(u)
 }
 
-// githubSignatureParams are query keys that rotate in presigned URLs. They
+// rotatingSignatureParams are query keys that rotate in presigned URLs. They
 // must not be part of a task identity, or a refreshed link looks like a new
 // download and the agent loses its resumable progress.
-var githubSignatureParams = map[string]bool{
+var rotatingSignatureParams = map[string]bool{
 	"sp": true, "sv": true, "sr": true, "sig": true, "se": true,
 	"st": true, "skt": true, "ske": true, "skoid": true, "sktid": true,
 	"sks": true, "skv": true, "jwt": true,
@@ -42,21 +42,42 @@ var githubSignatureParams = map[string]bool{
 	"X-Goog-Credential": true, "X-Goog-Algorithm": true, "X-Goog-SignedHeaders": true,
 	"Signature": true, "Expires": true, "Key-Pair-Id": true, "Policy": true,
 	"token": true,
+	// These only override response headers (the local filename/type), never
+	// the bytes, so a CDN rotating them must not change task identity.
+	"response-content-disposition": true, "response-content-type": true,
 }
 
-// CanonicalURL strips rotating signature parameters from a GitHub URL so the
-// same asset keeps one identity across link refreshes. It deliberately keeps
-// non-signature params such as ?id= or ?ref= — those select the actual bytes.
-// Non-GitHub URLs are returned unchanged.
+// signatureHost reports whether raw's query is expected to contain rotating
+// signature credentials. GitHub was the original case; HuggingFace's xet/LFS
+// bridge (cas-bridge.xethub.hf.co) and S3/GCS presigned URLs have the same
+// property, and a 3GB model download showed the cost of ignoring them: a
+// refreshed link created a new task and discarded 1.9GB of progress.
+func signatureHost(u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	if GitHubHost(u) {
+		return true
+	}
+	h := strings.ToLower(u.Hostname())
+	return h == "huggingface.co" || strings.HasSuffix(h, ".huggingface.co") ||
+		h == "hf.co" || strings.HasSuffix(h, ".hf.co") ||
+		strings.HasSuffix(h, ".xethub.hf.co")
+}
+
+// CanonicalURL strips rotating signature parameters so the same asset keeps
+// one identity across link refreshes. It deliberately keeps non-signature
+// params such as ?id= or ?ref= — those select the actual bytes. URLs from
+// hosts without rotating signatures are returned unchanged.
 func CanonicalURL(raw string) string {
 	u, err := url.Parse(raw)
-	if err != nil || !GitHubHost(u) {
+	if err != nil || !signatureHost(u) {
 		return raw
 	}
 	q := u.Query()
 	changed := false
 	for k := range q {
-		if githubSignatureParams[k] || githubSignatureParams[strings.ToLower(k)] {
+		if rotatingSignatureParams[k] || rotatingSignatureParams[strings.ToLower(k)] {
 			q.Del(k)
 			changed = true
 		}
@@ -68,17 +89,17 @@ func CanonicalURL(raw string) string {
 	return u.String()
 }
 
-// UseSingleStream reports whether this GitHub URL should avoid ranged
-// concurrency. A measured CDN path to release-assets showed wildly unstable
-// per-connection behavior (4s..200s for the same file), so 16-way splitting
-// amplified jitter instead of improving throughput.
-func UseSingleStream(raw string) bool {
+// GitHubThrottled reports whether this URL is on a GitHub CDN host whose
+// small-file concurrency should stay conservative. Measured release-asset
+// paths were jittery with 16 connections and faster at 4 for files under
+// 256MB; api.github.com is an API endpoint and is not treated this way.
+func GitHubThrottled(raw string) bool {
 	u, err := url.Parse(raw)
 	if err != nil || !GitHubHost(u) {
 		return false
 	}
 	h := strings.ToLower(u.Hostname())
-	// Raw files and codeload archives also come from GitHub's CDN; prefer a
-	// single stream there too. api.github.com can handle ranges cheaply.
+	// Raw files and codeload archives also come from GitHub's CDN; prefer the
+	// conservative cap there too. api.github.com can handle ranges cheaply.
 	return h != "api.github.com"
 }

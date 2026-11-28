@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -40,14 +41,29 @@ func NormalizeTarget(target string) (string, error) {
 // IDFor keys a download by url+target: re-calling with the same arguments
 // finds the same state file and resumes.
 func IDFor(rawURL, target string) string {
+	return IDForTask("", rawURL, target)
+}
+
+// IDForTask is IDFor with an optional caller-supplied task key. A non-empty
+// key wins over the URL entirely, which is the escape hatch for sources whose
+// signed URLs rotate faster than the download (HuggingFace/xet models, S3,
+// CloudFront). The target stays part of the hash so one key cannot collide
+// across two different destination files.
+func IDForTask(taskKey, rawURL, target string) string {
 	t, err := NormalizeTarget(target)
 	if err != nil {
 		t = filepath.Clean(target)
 	}
-	// Presigned GitHub URLs rotate their signature every hour; keying on the
-	// raw URL would turn a refreshed link into a brand-new task and throw away
-	// resumable bytes. CanonicalURL is a no-op for non-GitHub URLs.
-	h := sha256.Sum256([]byte(CanonicalURL(rawURL) + "\n" + t))
+	var h [32]byte
+	if key := strings.TrimSpace(taskKey); key != "" {
+		h = sha256.Sum256([]byte("task:" + key + "\n" + t))
+	} else {
+		// Presigned GitHub URLs rotate their signature every hour; keying on
+		// the raw URL would turn a refreshed link into a brand-new task and
+		// throw away resumable bytes. CanonicalURL is also a no-op for hosts
+		// it does not recognise.
+		h = sha256.Sum256([]byte(CanonicalURL(rawURL) + "\n" + t))
+	}
 	return hex.EncodeToString(h[:])
 }
 
@@ -61,9 +77,12 @@ type Store struct{ dir string }
 
 func NewStore() (*Store, error) {
 	dir := StateDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
+	// State files can contain presigned URLs (short-lived bearer credentials),
+	// so keep the directory and files private even if it pre-existed.
+	_ = os.Chmod(dir, 0o700)
 	return &Store{dir: dir}, nil
 }
 
@@ -137,10 +156,13 @@ func (s *Store) marshal(st *State) ([]byte, error) {
 
 func (s *Store) writeState(st *State, b []byte, sync bool) error {
 	tmp := s.Path(st.ID) + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
+	// The mode argument above only applies at creation; a state file created
+	// by an older version is still 0644, so tighten it on every write.
+	_ = f.Chmod(0o600)
 	if _, err := f.Write(b); err != nil {
 		f.Close()
 		return err

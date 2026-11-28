@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 var (
@@ -17,7 +18,8 @@ var (
 
 // GitHubToken resolves a token without ever putting it in argv: prefer
 // GITHUB_TOKEN / GH_TOKEN, then `gh auth token`. An empty result is fine —
-// public assets work without a token.
+// public assets work without a token. The gh subprocess is bounded so a
+// stuck credential prompt cannot wedge a download that never needed GitHub.
 func GitHubToken() string {
 	tokenOnce.Do(func() {
 		ghToken = strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
@@ -26,7 +28,9 @@ func GitHubToken() string {
 		}
 		if ghToken == "" {
 			if p, err := exec.LookPath("gh"); err == nil {
-				if out, err := exec.CommandContext(context.Background(), p, "auth", "token").Output(); err == nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if out, err := exec.CommandContext(ctx, p, "auth", "token").Output(); err == nil {
 					ghToken = strings.TrimSpace(string(out))
 				}
 			}
@@ -38,32 +42,51 @@ func GitHubToken() string {
 // githubAuthTransport attaches Authorization only to GitHub-owned API hosts.
 // GitHub releases redirect to release-assets.githubusercontent.com with a
 // presigned URL; sending the token there would leak it and is rejected anyway.
+//
+// Resolution is lazy: a plain non-GitHub download never spawns `gh auth
+// token`, which used to add startup latency (and a hang risk) to every fetch
+// on a machine that happens to have gh installed.
 type githubAuthTransport struct {
-	base   http.RoundTripper
-	token  string
-	secure bool // strip credentials even on non-GitHub redirects
+	base    http.RoundTripper
+	token   string
+	resolve func() string
+	once    sync.Once
+}
+
+func (t *githubAuthTransport) bearer() string {
+	if t.token != "" {
+		return t.token
+	}
+	if t.resolve != nil {
+		t.once.Do(func() { t.token = strings.TrimSpace(t.resolve()) })
+	}
+	return t.token
 }
 
 func (t *githubAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	r := req.Clone(req.Context())
 	h := strings.ToLower(r.URL.Hostname())
 	githubAPI := h == "github.com" || h == "api.github.com"
-	if !githubAPI || t.secure {
+	if !githubAPI {
+		// Strip caller-supplied credentials too: a cross-host redirect must
+		// never carry a token to the CDN.
 		r.Header.Del("Authorization")
-	} else if t.token != "" && r.Header.Get("Authorization") == "" {
-		r.Header.Set("Authorization", "Bearer "+t.token)
+	} else if r.Header.Get("Authorization") == "" {
+		if tok := t.bearer(); tok != "" {
+			r.Header.Set("Authorization", "Bearer "+tok)
+		}
 	}
 	return t.base.RoundTrip(r)
 }
 
 // WrapGitHubAuth returns a transport that adds a GitHub token for API hosts
-// and strips it everywhere else. Pass-through when no token is available.
+// and strips it everywhere else. It always wraps (even without a token) so a
+// caller-provided Authorization header is still removed on non-GitHub hosts.
 func WrapGitHubAuth(base http.RoundTripper) http.RoundTripper {
-	tok := GitHubToken()
-	if tok == "" || base == nil {
-		return base
+	if base == nil {
+		return nil
 	}
-	return &githubAuthTransport{base: base, token: tok}
+	return &githubAuthTransport{base: base, resolve: GitHubToken}
 }
 
 // SafeRedirectPolicy caps redirects and refuses https -> http downgrades.

@@ -176,7 +176,7 @@ func (a *Aria2) Start(ctx context.Context, st *core.State, store *core.Store) er
 			if v, e := strconv.ParseInt(s.TotalLength, 10, 64); e == nil && v > 0 {
 				cp.Total = v
 			}
-			_ = store.Put(&cp)
+			_ = store.PutProgress(&cp)
 			switch s.Status {
 			case "complete":
 				return nil

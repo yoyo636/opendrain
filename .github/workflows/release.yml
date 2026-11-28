@@ -18,12 +18,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # All targets are pure-Go cross-compiles (CGO_ENABLED=0), so they can
+        # all build on one Linux runner. Using macOS/Windows runners made the
+        # release hostage to runner-label availability (macos-14 was retired
+        # for this repo and the whole v0.2.0 matrix failed in 1s).
         include:
-          - { runner: macos-14,      goos: darwin,  goarch: arm64,  asset: opendrain-darwin-arm64 }
-          - { runner: macos-13,      goos: darwin,  goarch: amd64,  asset: opendrain-darwin-amd64 }
+          - { runner: ubuntu-latest, goos: darwin,  goarch: arm64,  asset: opendrain-darwin-arm64 }
+          - { runner: ubuntu-latest, goos: darwin,  goarch: amd64,  asset: opendrain-darwin-amd64 }
           - { runner: ubuntu-latest, goos: linux,   goarch: amd64,  asset: opendrain-linux-amd64 }
-          - { runner: ubuntu-24.04-arm, goos: linux, goarch: arm64, asset: opendrain-linux-arm64 }
-          - { runner: windows-latest, goos: windows, goarch: amd64, asset: opendrain-windows-amd64.exe }
+          - { runner: ubuntu-latest, goos: linux,   goarch: arm64,  asset: opendrain-linux-arm64 }
+          - { runner: ubuntu-latest, goos: windows, goarch: amd64,  asset: opendrain-windows-amd64.exe }
     steps:
       - uses: actions/checkout@v4
 

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -19,6 +21,7 @@ import (
 	"opendrain/internal/action"
 	"opendrain/internal/backend"
 	"opendrain/internal/core"
+	"opendrain/internal/dap"
 )
 
 //go:embed skills/opendrain/SKILL.md
@@ -58,6 +61,8 @@ func main() {
 		runInstall()
 	case "act":
 		runAct(os.Args[2:])
+	case "dap":
+		runDAP(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
 		usage()
@@ -84,6 +89,7 @@ Usage:
                  [--mirror URL]... [--backend auto|native|aria2] [--no-resume]
                          download via the action layer (agent-facing entry point)
   opendrain install          install the opendrain skill into agent configs
+  opendrain dap                         serve DAP v1 (NDJSON on stdin/stdout)
   opendrain --version | --help
 
 fetch(url, target, checksum?, mirrors?, resume?) — bytes go to disk, one small
@@ -185,6 +191,41 @@ func runFetch(args []string) {
 	emit(res)
 	if !res.OK {
 		os.Exit(1)
+	}
+}
+
+// runDAP serves the Download Action Protocol over NDJSON on stdin/stdout.
+// Each input line is one Request; each output line is one Response. Agent
+// runtimes spawn this process and talk to it instead of giving agents curl.
+func runDAP(args []string) {
+	_ = args // reserved for future transport flags
+	server, err := dap.NewServer()
+	if err != nil {
+		resp := &dap.Response{DAP: dap.Version, Error: &core.ErrInfo{
+			Code: core.CodeInternal, Message: "start DAP server: " + err.Error()}}
+		b, _ := dap.Encode(resp)
+		os.Stdout.Write(b)
+		os.Exit(1)
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 64<<10), 16<<20)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		resp := server.Dispatch(context.Background(), line)
+		b, err := dap.Encode(resp)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "dap encode:", err)
+			continue
+		}
+		if _, err := os.Stdout.Write(b); err != nil {
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "dap stdin:", err)
 	}
 }
 

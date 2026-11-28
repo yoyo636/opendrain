@@ -8,6 +8,19 @@ opendrain act --url URL --target PATH [--checksum sha256:HEX] [--task-key KEY]
 
 完整设计见 [docs/download-action-layer.md](docs/download-action-layer.md)；`internal/action` 是可被任意 harness 直接调用的核心。传统 `fetch` CLI 作为兼容入口保留。
 
+### DAP v1 协议（跨 harness 接入）
+
+要让任意 Agent 运行时接入同一套"下载行动"，走 **DAP v1**：传输无关，Agent 只发意图，服务端回句柄，内容绝不跨协议边界。
+
+```sh
+opendrain dap   # stdin/stdout 上的 NDJSON，每行一个 JSON Request/Response
+```
+
+- 规范：[protocol/DAP-v1.md](protocol/DAP-v1.md)
+- 机器可读 schema：[protocol/dap-v1.schema.json](protocol/dap-v1.schema.json)
+- 参考实现：`internal/dap`（分发器 + NDJSON binding + 参考客户端）
+- 一致性测试：7 项，覆盖能力协商、act、错误码、版本/方法校验、manifest/verify、编解码与客户端管道通信
+
 普通下载器的用户是人；OpenDrain 的用户是 Agent——它可能在任意一步被杀（compaction/超时），
 所以状态落盘可续传；它不"打开看看"，所以字节必须可校验（有 checksum 时强校验，没有时
 明确报告 `integrity: "unverified"`，而不是把 `ok` 当成"内容正确"）；它不读设置面板，

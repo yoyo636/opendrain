@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/yoyo636/opendrain/protocol/dap-v1.schema.json",
+  "title": "DAP v1 - Download Action Protocol",
+  "description": "Machine-readable schema for DAP v1 requests and responses.",
+  "type": "object",
+  "required": ["dap", "id", "method", "params"],
+  "additionalProperties": false,
+  "properties": {
+    "dap": { "const": "1.0", "description": "Protocol version" },
+    "id": { "type": "string", "minLength": 1, "description": "Client-generated correlation id" },
+    "method": { "$ref": "#/$defs/method" },
+    "params": { "type": "object" }
+  },
+  "$defs": {
+    "method": {
+      "type": "string",
+      "enum": ["capabilities", "act", "manifest", "verify", "clean", "read"]
+    },
+    "checksum": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-fA-F]{64}$"
+    },
+    "backend": {
+      "type": "string",
+      "enum": ["auto", "native", "aria2"]
+    },
+    "intent": {
+      "type": "object",
+      "required": ["url", "target"],
+      "additionalProperties": true,
+      "properties": {
+        "url": { "type": "string", "pattern": "^https?://" },
+        "target": { "type": "string", "minLength": 1 },
+        "checksum": { "$ref": "#/$defs/checksum" },
+        "mirrors": { "type": "array", "items": { "type": "string" } },
+        "task_key": { "type": "string" },
+        "backend": { "$ref": "#/$defs/backend" },
+        "resume": { "type": "boolean", "default": true }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "bad_request", "no_mirror_reachable", "all_mirrors_failed",
+            "checksum_mismatch", "incomplete", "state_corrupt",
+            "state_not_found", "cancelled", "backend_failed",
+            "internal_error", "unsupported_method", "unsupported_version"
+          ]
+        },
+        "message": { "type": "string" },
+        "detail": { "type": "object" }
+      }
+    },
+    "handle": {
+      "type": "object",
+      "required": ["id", "target", "bytes", "sha256", "integrity", "resumed", "cached", "status"],
+      "properties": {
+        "id": { "type": "string" },
+        "target": { "type": "string" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "integrity": { "type": "string", "enum": ["checksum", "unverified"] },
+        "resumed": { "type": "boolean" },
+        "cached": { "type": "boolean" },
+        "status": { "type": "string", "enum": ["completed", "failed", "cancelled"] },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "error": { "$ref": "#/$defs/error" }
+      },
+      "description": "Never contains file content."
+    },
+    "manifestEntry": {
+      "type": "object",
+      "required": ["id", "url", "target", "status", "on_disk"],
+      "properties": {
+        "id": { "type": "string" },
+        "url": { "type": "string" },
+        "target": { "type": "string" },
+        "status": { "type": "string" },
+        "bytes": { "type": "integer" },
+        "sha256": { "type": "string" },
+        "on_disk": { "type": "boolean" },
+        "verified": { "type": "boolean" },
+        "note": { "type": "string" }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "required": ["ok", "count", "on_disk", "entries"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "count": { "type": "integer" },
+        "on_disk": { "type": "integer" },
+        "entries": { "type": "array", "items": { "$ref": "#/$defs/manifestEntry" } },
+        "duration_ms": { "type": "integer" }
+      }
+    },
+    "response": {
+      "type": "object",
+      "required": ["dap", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "dap": { "const": "1.0" },
+        "id": { "type": "string" },
+        "result": { "description": "Method-specific result; null when error is set" },
+        "error": { "$ref": "#/$defs/error" }
+      },
+      "description": "Exactly one of result/error must be non-null."
+    }
+  }
+}

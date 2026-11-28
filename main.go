@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"opendrain/internal/action"
 	"opendrain/internal/backend"
 	"opendrain/internal/core"
 )
@@ -55,6 +56,8 @@ func main() {
 		runRead(os.Args[2:])
 	case "install":
 		runInstall()
+	case "act":
+		runAct(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
 		usage()
@@ -77,6 +80,9 @@ Usage:
   opendrain verify [--target PATH]   re-hash managed files against stored digests
   opendrain read --target PATH [--grep RE] [--context N] [--head N | --tail N]
                           [--max-bytes N]   bounded excerpt, no bulk context cost
+  opendrain act --url URL --target PATH [--checksum sha256:HEX] [--task-key KEY]
+                 [--mirror URL]... [--backend auto|native|aria2] [--no-resume]
+                         download via the action layer (agent-facing entry point)
   opendrain install          install the opendrain skill into agent configs
   opendrain --version | --help
 
@@ -178,6 +184,48 @@ func runFetch(args []string) {
 	close(done)
 	emit(res)
 	if !res.OK {
+		os.Exit(1)
+	}
+}
+
+// runAct is the DAL entry point: it takes an intent, never content, and
+// returns a compact handle. Harnesses can call this directly instead of
+// giving agents curl/wget.
+func runAct(args []string) {
+	fs := flag.NewFlagSet("act", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var mirrors strList
+	urlF := fs.String("url", "", "source URL (http/https)")
+	targetF := fs.String("target", "", "local destination path")
+	checksumF := fs.String("checksum", "", "sha256:<hex>")
+	taskKeyF := fs.String("task-key", "", "stable task identity for rotating URLs")
+	fs.Var(&mirrors, "mirror", "candidate mirror URL (repeatable)")
+	fs.Var(&mirrors, "mirrors", "alias of --mirror (repeatable)")
+	noResume := fs.Bool("no-resume", false, "restart from scratch")
+	backendF := fs.String("backend", "auto", "auto | native | aria2")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if *urlF == "" || *targetF == "" {
+		usage()
+		os.Exit(2)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	layer, err := action.New()
+	if err != nil {
+		emit(&action.Handle{Status: core.StatusFailed,
+			Error: &core.ErrInfo{Code: core.CodeInternal, Message: err.Error()}})
+		os.Exit(1)
+	}
+	h := layer.Act(ctx, action.Intent{
+		URL: *urlF, Target: *targetF, Checksum: *checksumF,
+		Mirrors: mirrors, TaskKey: *taskKeyF, Backend: *backendF, Resume: !*noResume,
+	})
+	emit(h)
+	if !h.OK() {
 		os.Exit(1)
 	}
 }

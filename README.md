@@ -1,6 +1,12 @@
-# OpenDrain — Agent-native 下载层
+# OpenDrain — Download Action Layer (DAL)
 
-以 Opencode skill 形态存在的文件 I/O 原语：`fetch(url, target, checksum?, mirrors?, resume?)`。
+**一种新的 Agent 组件类型：下载行动层（Download Action Layer）。** 不是 skill，不是 MCP tool——它接管 Agent 的整个下载行动：Agent 只表达"我要这份字节"的意图，DAL 负责探测、续传、校验、原子发布，并只回一个小句柄。skill 只是它的适配层之一。
+
+```sh
+opendrain act --url URL --target PATH [--checksum sha256:HEX] [--task-key KEY]
+```
+
+完整设计见 [docs/download-action-layer.md](docs/download-action-layer.md)；`internal/action` 是可被任意 harness 直接调用的核心。传统 `fetch` CLI 作为兼容入口保留。
 
 普通下载器的用户是人；OpenDrain 的用户是 Agent——它可能在任意一步被杀（compaction/超时），
 所以状态落盘可续传；它不"打开看看"，所以字节必须可校验（有 checksum 时强校验，没有时
